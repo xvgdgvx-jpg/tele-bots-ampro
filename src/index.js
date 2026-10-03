@@ -759,9 +759,8 @@ async function startAddChannel(env, chatId, messageId, userId) {
   text += "━━━━━━━━━━━━━━━━━━\n\n";
   text += "📝 أرسل يوزر القناة\n";
   text += "مثال: @Ampro_off";
-  const kb = { inline_keyboard: [[{ text: "❌ إلغاء", callback;
-_data     : "admin_channels" }]] };
- state  await editMessage(env.BOT_TOKEN, chatId, message.stId, text, kb);
+  const kb = { inline_keyboard: [[{ text: "❌ إلغاء", callback_data: "admin_channels" }]] };
+  await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
 }
 
 // ============================================
