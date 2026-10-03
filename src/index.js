@@ -59,6 +59,9 @@ async function handleMessage(msg, env) {
     return;
   }
 
+  const userHandled = await handleUserInput(env, chatId, userId, msg, text);
+  if (userHandled) return;
+
   if (text === "/start" || text.startsWith("/start ")) {
     const parts = text.split(" ");
     if (parts[1] && parts[1].startsWith("ref_")) {
@@ -139,6 +142,34 @@ async function routeCallback(env, chatId, messageId, userId, user, data, callbac
     return await showSmmCategory(env, chatId, messageId, category);
   }
 
+  // ===== تفاصيل الباقة =====
+  if (data.startsWith("pkg_")) {
+    const pkgId = parseInt(data.replace("pkg_", ""));
+    return await showPackageDetails(env, chatId, messageId, pkgId);
+  }
+
+  // ===== تفاصيل خدمة =====
+  if (data.startsWith("svc_")) {
+    const svcId = parseInt(data.replace("svc_", ""));
+    return await showServiceDetails(env, chatId, messageId, svcId);
+  }
+
+  // ===== بدء الطلب =====
+  if (data.startsWith("order_pkg_")) {
+    const pkgId = parseInt(data.replace("order_pkg_", ""));
+    return await startOrder(env, chatId, messageId, userId, "package", pkgId);
+  }
+  if (data.startsWith("order_svc_")) {
+    const svcId = parseInt(data.replace("order_svc_", ""));
+    return await startOrder(env, chatId, messageId, userId, "service", svcId);
+  }
+
+  // ===== إلغاء الطلب =====
+  if (data === "order_cancel") {
+    await clearUserState(env, userId);
+    return await showMainMenu(env, chatId, messageId, user);
+  }
+
   // ===== حسابي =====
   if (data === "menu_account") return await showAccount(env, chatId, messageId, user);
 
@@ -169,6 +200,27 @@ async function routeCallback(env, chatId, messageId, userId, user, data, callbac
   if (data === "admin_orders") return await answerCallback(env.BOT_TOKEN, callbackId, "🚧 قريباً", true);
   if (data === "admin_gifts") return await answerCallback(env.BOT_TOKEN, callbackId, "🚧 قريباً", true);
   if (data === "admin_stats") return await showAdminStats(env, chatId, messageId);
+
+  // ===== إجراءات الطلبات (أدمن فقط) =====
+  if (data.startsWith("admin_confirm_") || data.startsWith("admin_cancel_")) {
+    if (!await checkAdmin(env, userId)) return;
+  }
+  if (data.startsWith("admin_confirm_final_")) {
+    const orderId = parseInt(data.replace("admin_confirm_final_", ""));
+    return await adminFinalizeOrder(env, chatId, messageId, orderId);
+  }
+  if (data.startsWith("admin_confirm_back_")) {
+    const orderId = parseInt(data.replace("admin_confirm_back_", ""));
+    return await adminBackToOrder(env, chatId, messageId, orderId);
+  }
+  if (data.startsWith("admin_confirm_")) {
+    const orderId = parseInt(data.replace("admin_confirm_", ""));
+    return await adminConfirmOrder(env, chatId, messageId, orderId);
+  }
+  if (data.startsWith("admin_cancel_")) {
+    const orderId = parseInt(data.replace("admin_cancel_", ""));
+    return await adminAskCancelReason(env, chatId, messageId, userId, orderId);
+  }
 
   // ===== افتراضي =====
   await answerCallback(env.BOT_TOKEN, callbackId, "🚧 قريباً", true);
@@ -901,6 +953,29 @@ async function handleAdminInput(env, chatId, userId, text, state) {
     return true;
   }
 
+  // ===== إلغاء طلب =====
+  if (state.action === "cancel_order") {
+    const reason = text;
+    const orderId = state.order_id;
+    const order = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first();
+    if (order) {
+      await env.DB.prepare("UPDATE orders SET status = 'cancelled', cancel_reason = ? WHERE id = ?").bind(reason, orderId).run();
+
+      let msgUser = "❌ <b>تم إلغاء طلبك</b>\n";
+      msgUser += "━━━━━━━━━━━━━━━━━━\n\n";
+      msgUser += "📦 الطلب: <code>" + order.order_number + "</code>\n\n";
+      msgUser += "📝 <b>السبب:</b>\n" + reason + "\n\n";
+      msgUser += "━━━━━━━━━━━━━━━━━━\n";
+      msgUser += "🔄 يمكنك إعادة الطلب\n";
+      msgUser += "مع مراعاة حل المشكلة\n\n";
+      msgUser += "📞 للاستفسار: @ub_6p";
+      await sendMessage(env.BOT_TOKEN, order.user_id, msgUser);
+    }
+    await clearAdminState(env, userId);
+    await sendMessage(env.BOT_TOKEN, chatId, "✅ <b>تم إرسال الإلغاء للمشتري</b>");
+    return true;
+  }
+
   // ===== إضافة أدمن =====
   if (state.action === "add_admin" && state.step === "user_id") {
     const id = parseInt(text);
@@ -1025,5 +1100,408 @@ async function getAdminState(env, userId) {
 async function clearAdminState(env, userId) {
   try {
     await env.DB.prepare("DELETE FROM settings WHERE key = ?").bind("admin_state_" + userId).run();
+  } catch (e) {}
+}
+
+// ============================================
+// تفاصيل الباقة
+// ============================================
+async function showPackageDetails(env, chatId, messageId, pkgId) {
+  const pkg = await env.DB.prepare("SELECT * FROM packages WHERE id = ?").bind(pkgId).first();
+  if (!pkg) {
+    return await editMessage(env.BOT_TOKEN, chatId, messageId, "❌ الباقة غير موجودة", {
+      inline_keyboard: [[{ text: "⬅️ رجوع", callback_data: "main_menu" }]]
+    });
+  }
+
+  let text = "";
+  if (pkg.type === "stars") {
+    const total = pkg.stars_amount + (pkg.bonus_amount || 0);
+    text = "⭐ <b>تفاصيل الباقة</b>\n";
+    text += "━━━━━━━━━━━━━━━━━━\n\n";
+    text += "📦 <b>" + pkg.name + "</b>\n\n";
+    text += "⭐ <b>عدد النجوم:</b> " + pkg.stars_amount + "\n";
+    if (pkg.bonus_amount > 0) {
+      text += "🎁 <b>البونص:</b> +" + pkg.bonus_amount + " نجمة\n";
+      text += "📊 <b>الإجمالي:</b> " + total + " نجمة\n";
+    }
+    text += "\n💵 <b>السعر:</b> " + pkg.price_iqd.toLocaleString() + " د.ع\n";
+  } else {
+    text = "🌟 <b>تفاصيل الاشتراك</b>\n";
+    text += "━━━━━━━━━━━━━━━━━━\n\n";
+    text += "📦 <b>" + pkg.name + "</b>\n\n";
+    text += "🌟 <b>المدة:</b> " + pkg.duration_months + " شهر\n";
+    text += "💵 <b>السعر:</b> " + pkg.price_iqd.toLocaleString() + " د.ع\n";
+  }
+
+  text += "\n━━━━━━━━━━━━━━━━━━\n";
+  text += "✅ شحن فوري بعد التأكيد\n";
+  text += "🛡 ضمان كامل\n";
+  text += "💬 دعم 24/7\n\n";
+  text += "👇 اضغط للطلب:";
+
+  const kb = {
+    inline_keyboard: [
+      [{ text: "✅ اطلب الآن", callback_data: "order_pkg_" + pkg.id }],
+      [{ text: "⬅️ رجوع", callback_data: pkg.type === "stars" ? "menu_stars" : "menu_premium" }]
+    ]
+  };
+  await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
+}
+
+async function showServiceDetails(env, chatId, messageId, svcId) {
+  const svc = await env.DB.prepare("SELECT * FROM smm_services WHERE id = ?").bind(svcId).first();
+  if (!svc) {
+    return await editMessage(env.BOT_TOKEN, chatId, messageId, "❌ الخدمة غير موجودة", {
+      inline_keyboard: [[{ text: "⬅️ رجوع", callback_data: "main_menu" }]]
+    });
+  }
+
+  let text = "🛍 <b>تفاصيل الخدمة</b>\n";
+  text += "━━━━━━━━━━━━━━━━━━\n\n";
+  text += "📌 <b>" + svc.name + "</b>\n";
+  text += "📁 الفئة: " + svc.category + "\n\n";
+  if (svc.description) {
+    text += "📝 " + svc.description + "\n\n";
+  }
+  text += "💵 <b>السعر لكل 1000:</b> " + svc.sell_price_iqd.toLocaleString() + " د.ع\n";
+  text += "📊 <b>الحد الأدنى:</b> " + svc.min_quantity.toLocaleString() + "\n";
+  text += "📊 <b>الحد الأقصى:</b> " + svc.max_quantity.toLocaleString() + "\n\n";
+  text += "━━━━━━━━━━━━━━━━━━\n";
+  text += "✅ جودة عالية\n";
+  text += "⚡ تنفيذ سريع\n";
+  text += "💬 دعم مباشر\n\n";
+  text += "👇 اضغط للطلب:";
+
+  const kb = {
+    inline_keyboard: [
+      [{ text: "✅ اطلب الآن", callback_data: "order_svc_" + svc.id }],
+      [{ text: "⬅️ رجوع", callback_data: "main_menu" }]
+    ]
+  };
+  await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
+}
+
+// ============================================
+// بدء الطلب - طلب اليوزر
+// ============================================
+async function startOrder(env, chatId, messageId, userId, orderType, itemId) {
+  await setUserState(env, userId, { action: "new_order", order_type: orderType, item_id: itemId, step: "username" });
+
+  let text = "📱 <b>بيانات الاستلام</b>\n";
+  text += "━━━━━━━━━━━━━━━━━━\n\n";
+  text += "أرسل يوزر حساب تيليجرام\n";
+  text += "اللي راح يتم الشحن له:\n\n";
+  text += "📝 <b>مثال:</b>\n";
+  text += "<code>@username</code>\n\n";
+  text += "⚠️ <b>ملاحظة:</b>\n";
+  text += "تأكد من اليوزر جيداً، لأن الشحن\n";
+  text += "يتم على المسؤولية.";
+
+  const kb = { inline_keyboard: [[{ text: "❌ إلغاء", callback_data: "order_cancel" }]] };
+  await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
+}
+
+// ============================================
+// معالجة حالات المستخدم (يوزر + صورة)
+// ============================================
+async function handleUserInput(env, chatId, userId, msg, text) {
+  const state = await getUserState(env, userId);
+  if (!state || state.action !== "new_order") return false;
+  if (text === "/cancel") {
+    await clearUserState(env, userId);
+    await sendMessage(env.BOT_TOKEN, chatId, "✅ تم إلغاء الطلب.");
+    return true;
+  }
+  if (text.startsWith("/")) return false;
+
+  // ===== استقبال اليوزر =====
+  if (state.step === "username") {
+    let username = text.trim();
+    if (!username.startsWith("@")) username = "@" + username;
+    state.data = { username: username };
+    state.step = "photo";
+    await setUserState(env, userId, state);
+
+    let itemInfo = "";
+    if (state.order_type === "package") {
+      const pkg = await env.DB.prepare("SELECT * FROM packages WHERE id = ?").bind(state.item_id).first();
+      if (pkg) {
+        if (pkg.type === "stars") {
+          itemInfo = "⭐ " + pkg.stars_amount + " نجمة" + (pkg.bonus_amount > 0 ? " + " + pkg.bonus_amount + " بونص" : "") + "\n💵 " + pkg.price_iqd.toLocaleString() + " د.ع";
+        } else {
+          itemInfo = "🌟 " + pkg.duration_months + " شهر بريميوم\n💵 " + pkg.price_iqd.toLocaleString() + " د.ع";
+        }
+      }
+    } else {
+      const svc = await env.DB.prepare("SELECT * FROM smm_services WHERE id = ?").bind(state.item_id).first();
+      if (svc) itemInfo = "🛍 " + svc.name + "\n💵 " + svc.sell_price_iqd.toLocaleString() + " د.ع لكل 1000";
+    }
+
+    let msgText = "📸 <b>إرسال إثبات الدفع</b>\n";
+    msgText += "━━━━━━━━━━━━━━━━━━\n\n";
+    msgText += "📦 <b>تفاصيل الطلب:</b>\n";
+    msgText += itemInfo + "\n\n";
+    msgText += "📱 <b>يوزر الاستلام:</b>\n<code>" + username + "</code>\n\n";
+    msgText += "━━━━━━━━━━━━━━━━━━\n";
+    msgText += "💳 <b>طرق الدفع:</b>\n\n";
+    msgText += "🔵 <b>SuperQi:</b>\n<code>2061361271</code>\n\n";
+    msgText += "🟡 <b>Zain Cash:</b>\n<code>07731404160</code>\n\n";
+    msgText += "━━━━━━━━━━━━━━━━━━\n";
+    msgText += "📸 بعد التحويل، أرسل صورة الإيصال هنا:";
+
+    const kb = { inline_keyboard: [[{ text: "❌ إلغاء", callback_data: "order_cancel" }]] };
+    await sendMessage(env.BOT_TOKEN, chatId, msgText, kb);
+    return true;
+  }
+
+  // ===== استقبال صورة =====
+  if (state.step === "photo" && msg.photo) {
+    const photoId = msg.photo[msg.photo.length - 1].file_id;
+    await createOrder(env, chatId, userId, state, photoId);
+    return true;
+  }
+
+  if (state.step === "photo" && !msg.photo) {
+    await sendMessage(env.BOT_TOKEN, chatId, "⚠️ يرجى إرسال <b>صورة</b> الإيصال.");
+    return true;
+  }
+
+  return false;
+}
+
+// ============================================
+// إنشاء الطلب + إشعار الأدمن
+// ============================================
+async function createOrder(env, chatId, userId, state, photoId) {
+  const user = await getUser(env, userId);
+  const date = new Date();
+  const orderNumber = "AP" + date.getFullYear() + String(date.getMonth()+1).padStart(2,"0") + String(date.getDate()).padStart(2,"0") + "-" + String(date.getTime()).slice(-5);
+
+  let item = null;
+  let orderType = "stars";
+  let priceIqd = 0;
+  let targetUsername = state.data.username;
+
+  if (state.order_type === "package") {
+    item = await env.DB.prepare("SELECT * FROM packages WHERE id = ?").bind(state.item_id).first();
+    if (item) {
+      orderType = item.type;
+      priceIqd = item.price_iqd;
+    }
+  } else {
+    item = await env.DB.prepare("SELECT * FROM smm_services WHERE id = ?").bind(state.item_id).first();
+    if (item) {
+      orderType = "smm";
+      priceIqd = item.sell_price_iqd;
+    }
+  }
+
+  try {
+    const result = await env.DB.prepare(
+      "INSERT INTO orders (order_number, user_id, type, package_id, service_id, target_username, stars_amount, bonus_amount, price_iqd, payment_photo_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')"
+    ).bind(
+      orderNumber,
+      userId,
+      orderType,
+      state.order_type === "package" ? state.item_id : null,
+      state.order_type === "service" ? state.item_id : null,
+      targetUsername,
+      item?.stars_amount || 0,
+      item?.bonus_amount || 0,
+      priceIqd,
+      photoId
+    ).run();
+
+    const orderId = result.meta.last_row_id;
+
+    // ===== رسالة للمستخدم =====
+    let msgUser = "✅ <b>تم استلام طلبك بنجاح</b>\n";
+    msgUser += "━━━━━━━━━━━━━━━━━━\n\n";
+    msgUser += "📦 <b>رقم الطلب:</b> <code>" + orderNumber + "</code>\n\n";
+    if (orderType === "stars") {
+      msgUser += "⭐ النجوم: " + item.stars_amount + "\n";
+      if (item.bonus_amount > 0) msgUser += "🎁 البونص: +" + item.bonus_amount + "\n";
+    } else if (orderType === "premium") {
+      msgUser += "🌟 بريميوم: " + item.duration_months + " شهر\n";
+    } else {
+      msgUser += "🛍 الخدمة: " + item.name + "\n";
+    }
+    msgUser += "💵 المبلغ: " + priceIqd.toLocaleString() + " د.ع\n";
+    msgUser += "📱 يوزر الاستلام: <code>" + targetUsername + "</code>\n\n";
+    msgUser += "━━━━━━━━━━━━━━━━━━\n";
+    msgUser += "⏳ <b>طلبك قيد المعالجة</b>\n\n";
+    msgUser += "سيتم إشعارك عند الانتهاء\n";
+    msgUser += "خلال دقائق بإذن الله\n\n";
+    msgUser += "━━━━━━━━━━━━━━━━━━\n";
+    msgUser += "💡 <b>هل تعلم؟</b>\n";
+    msgUser += "يمكنك ربح نجوم مجانية\n";
+    msgUser += "تصل إلى <b>190 نجمة</b>\n";
+    msgUser += "عبر دعوة أصدقائك! 🎁";
+
+    const kbUser = {
+      inline_keyboard: [
+        [{ text: "🎁 ادعُ أصدقاءك", callback_data: "menu_referral" }],
+        [{ text: "🏠 الرئيسية", callback_data: "main_menu" }]
+      ]
+    };
+    await sendMessage(env.BOT_TOKEN, chatId, msgUser, kbUser);
+
+    // ===== إشعار للأدمن =====
+    let msgAdmin = "🆕 <b>طلب شحن جديد</b>\n";
+    msgAdmin += "━━━━━━━━━━━━━━━━━━\n\n";
+    msgAdmin += "📦 <b>الطلب:</b> <code>" + orderNumber + "</code>\n\n";
+    msgAdmin += "👤 <b>المشتري:</b> " + (user?.first_name || "غير معروف") + "\n";
+    msgAdmin += "🔗 <b>اليوزر:</b> " + (user?.username ? "@" + user.username : "لا يوجد") + "\n";
+    msgAdmin += "🆔 <b>الآيدي:</b> <code>" + userId + "</code>\n\n";
+    msgAdmin += "━━━━━━━━━━━━━━━━━━\n";
+    if (orderType === "stars") {
+      msgAdmin += "⭐ <b>الباقة:</b> " + item.name + "\n";
+      msgAdmin += "📊 <b>النجوم:</b> " + item.stars_amount + "\n";
+      if (item.bonus_amount > 0) msgAdmin += "🎁 <b>البونص:</b> +" + item.bonus_amount + "\n";
+    } else if (orderType === "premium") {
+      msgAdmin += "🌟 <b>الباقة:</b> " + item.name + "\n";
+      msgAdmin += "📅 <b>المدة:</b> " + item.duration_months + " شهر\n";
+    } else {
+      msgAdmin += "🛍 <b>الخدمة:</b> " + item.name + "\n";
+    }
+    msgAdmin += "💵 <b>المبلغ:</b> " + priceIqd.toLocaleString() + " د.ع\n";
+    msgAdmin += "📱 <b>يوزر الاستلام:</b>\n<code>" + targetUsername + "</code>\n\n";
+    msgAdmin += "━━━━━━━━━━━━━━━━━━\n";
+    msgAdmin += "👇 <b>اتخذ إجراء:</b>";
+
+    const kbAdmin = {
+      inline_keyboard: [
+        [{ text: "✅ تأكيد", callback_data: "admin_confirm_" + orderId }, { text: "❌ إلغاء", callback_data: "admin_cancel_" + orderId }]
+      ]
+    };
+
+    // إرسال الصورة + الرسالة
+    await fetch("https://api.telegram.org/bot" + env.BOT_TOKEN + "/sendPhoto", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: SUPER_ADMIN,
+        photo: photoId,
+        caption: msgAdmin,
+        parse_mode: "HTML",
+        reply_markup: kbAdmin
+      })
+    });
+
+    await clearUserState(env, userId);
+  } catch (e) {
+    console.error("createOrder:", e);
+    await sendMessage(env.BOT_TOKEN, chatId, "❌ حدث خطأ، حاول مرة أخرى لاحقاً.");
+  }
+}
+
+// ============================================
+// معالج طلب الأدمن
+// ============================================
+async function adminConfirmOrder(env, chatId, messageId, orderId) {
+  const order = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first();
+  if (!order) return;
+
+  let text = "⚠️ <b>تأكيد نهائي</b>\n";
+  text += "━━━━━━━━━━━━━━━━━━\n\n";
+  text += "📦 الطلب: <code>" + order.order_number + "</code>\n";
+  text += "📱 يوزر الاستلام: <code>" + order.target_username + "</code>\n";
+  text += "💵 المبلغ: " + order.price_iqd.toLocaleString() + " د.ع\n\n";
+  text += "━━━━━━━━━━━━━━━━━━\n";
+  text += "❓ هل قمت بشحن الطلب فعلاً؟";
+
+  const kb = {
+    inline_keyboard: [
+      [{ text: "✅ نعم، تم الشحن", callback_data: "admin_confirm_final_" + orderId }],
+      [{ text: "⬅️ رجوع", callback_data: "admin_confirm_back_" + orderId }]
+    ]
+  };
+  await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
+}
+
+async function adminBackToOrder(env, chatId, messageId, orderId) {
+  const order = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first();
+  if (!order) return;
+
+  const user = await getUser(env, order.user_id);
+  let text = "🆕 <b>طلب شحن جديد</b>\n━━━━━━━━━━━━━━━━━━\n\n";
+  text += "📦 <code>" + order.order_number + "</code>\n";
+  text += "👤 " + (user?.first_name || "غير معروف") + "\n";
+  text += "📱 <code>" + order.target_username + "</code>\n";
+  text += "💵 " + order.price_iqd.toLocaleString() + " د.ع";
+
+  const kb = {
+    inline_keyboard: [
+      [{ text: "✅ تأكيد", callback_data: "admin_confirm_" + orderId }, { text: "❌ إلغاء", callback_data: "admin_cancel_" + orderId }]
+    ]
+  };
+  await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
+}
+
+async function adminFinalizeOrder(env, chatId, messageId, orderId) {
+  const order = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first();
+  if (!order) return;
+
+  await env.DB.prepare("UPDATE orders SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(orderId).run();
+
+  // إشعار المستخدم
+  let msgUser = "🎉 <b>مبروك!</b>\n";
+  msgUser += "━━━━━━━━━━━━━━━━━━\n\n";
+  msgUser += "✅ تم شحن طلبك بنجاح\n\n";
+  msgUser += "📦 الطلب: <code>" + order.order_number + "</code>\n";
+  if (order.type === "stars") {
+    msgUser += "⭐ النجوم: " + order.stars_amount + "\n";
+    if (order.bonus_amount > 0) msgUser += "🎁 البونص: +" + order.bonus_amount + "\n";
+    msgUser += "📊 الإجمالي: " + (order.stars_amount + order.bonus_amount) + " نجمة\n";
+  } else if (order.type === "premium") {
+    msgUser += "🌟 تم تفعيل بريموم حسابك\n";
+  }
+  msgUser += "\nشكراً لثقتك 💙\n\n";
+  msgUser += "━━━━━━━━━━━━━━━━━━\n";
+  msgUser += "💡 <b>احصل على نجوم مجانية</b>\n";
+  msgUser += "ادعُ أصدقاءك لتحصل على\n";
+  msgUser += "مكافآت تصل إلى 190 نجمة! 🎁";
+
+  const kb = {
+    inline_keyboard: [
+      [{ text: "🎁 ادعُ أصدقاءك", callback_data: "menu_referral" }],
+      [{ text: "🏠 الرئيسية", callback_data: "main_menu" }]
+    ]
+  };
+  await sendMessage(env.BOT_TOKEN, order.user_id, msgUser, kb);
+
+  await editMessage(env.BOT_TOKEN, chatId, messageId, "✅ <b>تم تأكيد الطلب بنجاح</b>\n\n📦 " + order.order_number, null);
+}
+
+async function adminAskCancelReason(env, chatId, messageId, adminId, orderId) {
+  await setAdminState(env, adminId, { action: "cancel_order", order_id: orderId });
+  let text = "❌ <b>إلغاء الطلب</b>\n";
+  text += "━━━━━━━━━━━━━━━━━━\n\n";
+  text += "📝 اكتب سبب الإلغاء:\n\n";
+  text += "(سيتم إرساله للمشتري)";
+  const kb = { inline_keyboard: [[{ text: "⬅️ رجوع", callback_data: "admin_confirm_back_" + orderId }]] };
+  await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
+}
+
+// ============================================
+// حالة المستخدم
+// ============================================
+async function setUserState(env, userId, state) {
+  await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+    .bind("user_state_" + userId, JSON.stringify(state)).run();
+}
+
+async function getUserState(env, userId) {
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind("user_state_" + userId).first();
+    if (!row) return null;
+    return JSON.parse(row.value);
+  } catch (e) { return null; }
+}
+
+async function clearUserState(env, userId) {
+  try {
+    await env.DB.prepare("DELETE FROM settings WHERE key = ?").bind("user_state_" + userId).run();
   } catch (e) {}
 }
