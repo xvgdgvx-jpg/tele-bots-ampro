@@ -77,7 +77,7 @@ class Statement {
     if (q.startsWith('select * from channels where is_active')) return { results: this.db.channels.filter(x => x.is_active) };
     if (q.startsWith('select * from admins order by')) return { results: this.db.admins };
     if (q.startsWith("select id, order_number, user_id, smm_order_id, smm_status from orders where status = 'pending'")) {
-      const terminal=new Set(['completed','canceled','cancelled','partial','refunded','failed']);
+      const terminal=new Set(['canceled','cancelled','partial','refunded','failed']);
       return { results:this.db.orders.filter(x=>x.status==='pending'&&x.type==='smm'&&x.smm_order_id&&Number(x.id)>Number(p[0]||0)&&!terminal.has(String(x.smm_status||'').toLowerCase())).sort((a,b)=>a.id-b.id).slice(0,20) };
     }
     if (q.startsWith('select * from packages where')) return { results: this.db.packages };

@@ -2202,7 +2202,7 @@ async function pollPendingSmmOrders(env) {
 
   const loadBatch = async (afterId) => {
     const { results } = await env.DB.prepare(
-      "SELECT id, order_number, user_id, smm_order_id, smm_status FROM orders WHERE status = 'pending' AND type = 'smm' AND smm_order_id IS NOT NULL AND TRIM(smm_order_id) != '' AND LOWER(COALESCE(smm_status, '')) NOT IN ('completed', 'canceled', 'cancelled', 'partial', 'refunded', 'failed') AND id > ? ORDER BY id ASC LIMIT 20"
+      "SELECT id, order_number, user_id, smm_order_id, smm_status FROM orders WHERE status = 'pending' AND type = 'smm' AND smm_order_id IS NOT NULL AND TRIM(smm_order_id) != '' AND LOWER(COALESCE(smm_status, '')) NOT IN ('canceled', 'cancelled', 'partial', 'refunded', 'failed') AND id > ? ORDER BY id ASC LIMIT 20"
     ).bind(afterId).all();
     return results || [];
   };
