@@ -47,6 +47,7 @@ class Statement {
     if (q.startsWith('select * from orders where id =')) return this.db.orders.find(x => x.id === Number(p[0])) || null;
     if (q.startsWith('select * from smm_services where id =')) return this.db.services.find(x => x.id === Number(p[0])) || null;
     if (q.startsWith('select * from smm_services where smmcp_service_id =')) return this.db.services.find(x => x.smmcp_service_id === String(p[0])) || null;
+    if (q.includes('count(*)') && q.includes('from orders where service_id =')) return { c:this.db.orders.filter(x=>x.service_id===Number(p[0])).length };
     if (q.startsWith('select * from packages where id =')) return this.db.packages.find(x => x.id === Number(p[0])) || null;
     if (q.startsWith('select * from gift_requests where id =')) return this.db.gifts.find(x => x.id === Number(p[0])) || null;
     if (q.includes('count(*)') && q.includes('from referrals') && q.includes('has_qualified = 1')) return { c: this.db.referrals.filter(x => x.referrer_id === Number(p[0]) && x.has_qualified === 1).length };
@@ -74,6 +75,9 @@ class Statement {
     if (q.startsWith('select level, status from gift_requests where user_id =')) return { results: this.db.gifts.filter(x => x.user_id === Number(p[0])).map(x=>({level:x.level,status:x.status})) };
     if (q.startsWith('select * from channels where is_active')) return { results: this.db.channels.filter(x => x.is_active) };
     if (q.startsWith('select * from packages where')) return { results: this.db.packages };
+    if (q.startsWith('select id, smmcp_service_id, name from smm_services')) return { results: this.db.services.filter(x=>!String(x.smmcp_service_id).startsWith('manual_')).map(({id,smmcp_service_id,name})=>({id,smmcp_service_id,name})) };
+    if (q.includes('from smm_services where category =')) return { results: this.db.services.filter(x=>x.category===p[0]&&x.is_active===1) };
+    if (q.startsWith('select * from smm_services order by')) return { results: this.db.services };
     if (q.startsWith('select * from smm_services where')) return { results: this.db.services };
     return { results: [] };
   }
@@ -94,6 +98,26 @@ class Statement {
       const service=this.db.services.find(x=>x.id===Number(p[1]));
       if(service) service.description=p[0];
       return this.result(service?1:0);
+    }
+    if (q.startsWith('update smm_services set name =')) {
+      const service=this.db.services.find(x=>x.id===Number(p[1]));
+      if(service) service.name=p[0];
+      return this.result(service?1:0);
+    }
+    if (q.startsWith('update smm_services set is_active =')) {
+      const parameterized=q.includes('set is_active = ?');
+      const serviceId=Number(parameterized?p[1]:p[0]);
+      const newActive=parameterized?Number(p[0]):q.includes('set is_active = 0')?0:1;
+      const service=this.db.services.find(x=>x.id===serviceId);
+      const expected=q.includes('and is_active = 1')?1:q.includes('and is_active = 0')?0:null;
+      const changed=service&&(expected===null||service.is_active===expected);
+      if(changed) service.is_active=newActive;
+      return this.result(changed?1:0);
+    }
+    if (q.startsWith('delete from smm_services where id =')) {
+      const index=this.db.services.findIndex(x=>x.id===Number(p[0])&&x.is_active===1);
+      if(index>=0) this.db.services.splice(index,1);
+      return this.result(index>=0?1:0);
     }
     if (q.startsWith('insert into smm_services')) {
       const row=q.includes('provider_rate_usd')
@@ -140,6 +164,8 @@ class Statement {
 const db = new MemoryD1();
 const telegramCalls = [];
 const smmServices = [];
+const adRequests = [];
+let adResponse = { image:'https://cdn.example.test/ad.jpg', clickUrl:'https://advertiser.example.test/campaign', buttonText:'شاهد العرض', text:'عرض تجريبي' };
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async (url, init={}) => {
   if (String(url) === 'https://smmcpan.com/api/v2') {
@@ -148,6 +174,10 @@ globalThis.fetch = async (url, init={}) => {
     assert.equal(form.get('key'),'test-smm-key');
     return new Response(JSON.stringify(smmServices), {status:200,headers:{'content-type':'application/json'}});
   }
+  if (String(url) === 'https://bid.tgads.live/bid-request') {
+    adRequests.push(JSON.parse(String(init.body)));
+    return new Response(JSON.stringify(adResponse || {}), {status:200,headers:{'content-type':'application/json'}});
+  }
   assert.equal(String(url).startsWith(TG_BASE), true, `unexpected outbound request: ${url}`);
   const method = String(url).split('/').at(-1);
   const body = init.body ? JSON.parse(init.body) : {};
@@ -155,7 +185,7 @@ globalThis.fetch = async (url, init={}) => {
   const result = method === 'getMe' ? {username:'ampro_test_bot'} : {message_id:telegramCalls.length};
   return new Response(JSON.stringify({ok:true,result}), {status:200,headers:{'content-type':'application/json'}});
 };
-const env = {BOT_TOKEN:'test-only-token', SMMCPAN_KEY:'test-smm-key', DB:db};
+const env = {BOT_TOKEN:'test-only-token', SMMCPAN_KEY:'test-smm-key', ADEXIUM_WID:'test-widget-id', DB:db};
 async function deliver(update) {
   const pending=[];
   const response=await worker.fetch(new Request('https://worker.test/',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(update)}),env,{waitUntil:p=>pending.push(p)});
@@ -196,6 +226,8 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     assert.ok(db.settings.has(`user_state_${USER}`));
     await click(USER,'main_menu');
     assert.equal(db.settings.has(`user_state_${USER}`),false);
+    const mainMenu=telegramCalls.filter(x=>x.method==='editMessageText').at(-1);
+    assert.ok(JSON.stringify(mainMenu.body.reply_markup).includes('show_ad'));
   });
 
   await t.test('admin category and all service input steps save correct data', async () => {
@@ -236,7 +268,7 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     await message(ADMIN,'٧٥٠٠');
     const imported=db.services.find(x=>x.smmcp_service_id==='101');
     assert.equal(imported.category,'إنستغرام');
-    assert.equal(imported.name,'متابعين انستقرام');
+    assert.equal(imported.name,'متابعين انستقرام [حسابات عربية حقيقية] [عن طريق الاعلانات] [هام: اغلاق خاصية المراجعة قبل الطلب] [لا يمكن الغاء الطلب بعد وضعه]');
     assert.match(imported.description,/حسابات عربية حقيقية/);
     assert.doesNotMatch(imported.description,/Default/);
     assert.equal(imported.provider_rate_usd,0.9);
@@ -246,6 +278,11 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     assert.equal(db.settings.has(`admin_state_${ADMIN}`),false);
 
     let beforeView=telegramCalls.length;
+    await click(USER,'smm_instagram');
+    const serviceButtons=telegramCalls.slice(beforeView).find(x=>x.method==='editMessageText').body.reply_markup.inline_keyboard.flat();
+    assert.ok(serviceButtons.some(button=>button.callback_data===`svc_${imported.id}`&&button.text.startsWith(imported.name)));
+
+    beforeView=telegramCalls.length;
     await click(USER,`svc_${imported.id}`);
     let details=telegramCalls.slice(beforeView).find(x=>x.method==='editMessageText');
     assert.match(details.body.text,/شرح الخدمة/);
@@ -253,9 +290,7 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     assert.match(details.body.text,/لا يمكن الغاء الطلب بعد وضعه/);
     assert.doesNotMatch(details.body.text,/📝 Default/);
 
-    await click(ADMIN,'admin_services');
-    await click(ADMIN,'admin_svc_edit_desc');
-    await message(ADMIN,String(imported.id));
+    await click(ADMIN,`admin_svc_editdesc_${imported.id}`);
     assert.equal(db.settings.get(`admin_state_${ADMIN}`).step,'description');
     await message(ADMIN,'متابعون عرب حقيقيون، يرجى إغلاق مراجعة الحساب قبل الطلب.');
     assert.equal(imported.description,'متابعون عرب حقيقيون، يرجى إغلاق مراجعة الحساب قبل الطلب.');
@@ -265,7 +300,67 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     await click(USER,`svc_${imported.id}`);
     details=telegramCalls.slice(beforeView).find(x=>x.method==='editMessageText');
     assert.match(details.body.text,/متابعون عرب حقيقيون/);
-    assert.doesNotMatch(details.body.text,/حسابات عربية حقيقية/);
+    assert.match(details.body.text,/متابعين انستقرام \[حسابات عربية حقيقية\]/);
+    assert.doesNotMatch(details.body.text,/شرح الخدمة:<\/b>\nحسابات عربية حقيقية/);
+  });
+
+  await t.test('admin can permanently delete an unused service and safely hide one with order history', async () => {
+    const service=db.services.find(x=>x.smmcp_service_id==='101');
+    await click(ADMIN,'admin_svc_list');
+    const list=telegramCalls.filter(x=>x.method==='editMessageText').at(-1);
+    assert.ok(JSON.stringify(list.body.reply_markup).includes(`admin_svc_delete_${service.id}`));
+
+    await message(ADMIN,`/delsvc ${service.id}`);
+    const prompt=telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===ADMIN).at(-1);
+    assert.match(prompt.body.text,/تأكيد حذف الخدمة/);
+    assert.ok(JSON.stringify(prompt.body.reply_markup).includes(`admin_svc_delete_confirm_${service.id}`));
+    assert.equal(service.is_active,1,'the service must remain active until confirmation');
+
+    await click(ADMIN,`admin_svc_delete_confirm_${service.id}`);
+    assert.equal(db.services.includes(service),false,'an unused service is deleted after confirmation');
+    await click(USER,'smm_instagram');
+    const hidden=telegramCalls.filter(x=>x.method==='editMessageText').at(-1);
+    assert.equal(JSON.stringify(hidden.body.reply_markup).includes(`svc_${service.id}`),false);
+
+    const historical={id:77,smmcp_service_id:'provider_77',name:'خدمة لها طلبات',description:'',sell_price_iqd:5000,provider_rate_usd:0,min_quantity:1,max_quantity:100,is_active:1,category:'إنستغرام',sort_order:0};
+    db.services.push(historical);
+    db.orders.push({id:99,user_id:999,type:'smm',service_id:77,item_id:77,status:'completed',amount_iqd:5000});
+    await message(ADMIN,'/delsvc 77');
+    await click(ADMIN,'admin_svc_delete_confirm_77');
+    assert.ok(db.services.includes(historical),'services referenced by orders are retained');
+    assert.equal(historical.is_active,0,'a service with order history is removed from the shop');
+    await click(ADMIN,'admin_svc_activate_77');
+    assert.equal(historical.is_active,1,'a safely hidden service can be restored');
+  });
+
+  await t.test('the main-menu ad button requests an ad and handles an empty campaign response', async () => {
+    const before=telegramCalls.length;
+    const requestCount=adRequests.length;
+    await click(USER,'show_ad');
+    assert.equal(adRequests.length,requestCount+1);
+    assert.equal(adRequests.at(-1).wid,'test-widget-id');
+    assert.equal(adRequests.at(-1).language,'ar');
+    assert.equal(adRequests.at(-1).telegramId,String(USER));
+    const photo=telegramCalls.slice(before).find(x=>x.method==='sendPhoto');
+    assert.ok(photo);
+    assert.equal(photo.body.photo,'https://cdn.example.test/ad.jpg');
+    assert.equal(photo.body.reply_markup.inline_keyboard[0][0].url,'https://advertiser.example.test/campaign');
+
+    adResponse={};
+    const emptyBefore=telegramCalls.length;
+    await click(USER,'show_ad');
+    const emptyCalls=telegramCalls.slice(emptyBefore);
+    assert.ok(emptyCalls.some(x=>x.method==='sendMessage'&&String(x.body.text).includes('لا توجد إعلانات')));
+    assert.equal(emptyCalls.some(x=>x.method==='sendPhoto'),false);
+    adResponse={ image:'https://cdn.example.test/ad.jpg', clickUrl:'https://advertiser.example.test/campaign', buttonText:'شاهد العرض', text:'عرض تجريبي' };
+
+    env.ADEXIUM_WID='';
+    const noWidCount=adRequests.length;
+    const missingWidBefore=telegramCalls.length;
+    await click(USER,'show_ad');
+    assert.equal(adRequests.length,noWidCount,'no request is sent without an active widget ID');
+    assert.ok(telegramCalls.slice(missingWidBefore).some(x=>x.method==='sendMessage'&&String(x.body.text).includes('لا توجد إعلانات')));
+    env.ADEXIUM_WID='test-widget-id';
   });
 
   await t.test('SMM order collects a valid target link and bounded quantity before payment', async () => {

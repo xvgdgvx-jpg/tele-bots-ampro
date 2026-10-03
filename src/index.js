@@ -3,6 +3,7 @@
 // ============================================
 
 import { sendMessage, editMessage, editMessageCaption, answerCallback, isSubscribed, deleteMessage } from "./tg.js";
+import { sendAdToUser } from "./ads.js";
 
 const SUPER_ADMIN = 5313071841;
 const CHANNEL_URL = "https://t.me/Ampro_off";
@@ -48,6 +49,46 @@ async function handleMessage(msg, env) {
   const username = msg.from.username || "";
 
   await registerUser(env, userId, firstName, username);
+
+  const deleteServiceCommand = text.match(/^\/delsvc(?:@\w+)?(?:\s+(\S+))?$/i);
+  if (deleteServiceCommand) {
+    const commandUser = await getUser(env, userId);
+    if (commandUser?.is_blocked === 1) {
+      await sendMessage(env.BOT_TOKEN, chatId, "🚫 لا يمكن استخدام البوت من هذا الحساب.");
+      return;
+    }
+    if (!await checkAdmin(env, userId)) {
+      await sendMessage(env.BOT_TOKEN, chatId, "🚫 هذا الأمر للأدمن فقط.");
+      return;
+    }
+    const serviceId = parseSmmIqd(deleteServiceCommand[1]);
+    if (!Number.isSafeInteger(serviceId) || serviceId <= 0) {
+      await sendMessage(env.BOT_TOKEN, chatId, "استخدم الأمر بهذا الشكل: <code>/delsvc رقم_الخدمة</code>");
+    } else {
+      await requestServiceRemoval(env, chatId, null, serviceId);
+    }
+    return;
+  }
+
+  const editDescriptionCommand = text.match(/^\/editdesc(?:@\w+)?\s+(\S+)$/i);
+  if (editDescriptionCommand) {
+    const commandUser = await getUser(env, userId);
+    if (commandUser?.is_blocked === 1) {
+      await sendMessage(env.BOT_TOKEN, chatId, "🚫 لا يمكن استخدام البوت من هذا الحساب.");
+      return;
+    }
+    if (!await checkAdmin(env, userId)) {
+      await sendMessage(env.BOT_TOKEN, chatId, "🚫 هذا الأمر للأدمن فقط.");
+      return;
+    }
+    const serviceId = parseSmmIqd(editDescriptionCommand[1]);
+    if (!Number.isSafeInteger(serviceId) || serviceId <= 0) {
+      await sendMessage(env.BOT_TOKEN, chatId, "استخدم الأمر بهذا الشكل: <code>/editdesc رقم_الخدمة</code>");
+    } else {
+      await startEditServiceDescription(env, chatId, null, userId, serviceId);
+    }
+    return;
+  }
 
   // التحقق من الحالة الإدارية (إدخال بيانات)
   if (text === "/cancel") {
@@ -233,6 +274,15 @@ async function routeCallback(env, chatId, messageId, userId, user, data, callbac
   if (data === "menu_channels") return await showChannels(env, chatId, messageId);
   if (data === "menu_about") return await showAbout(env, chatId, messageId);
   if (data === "menu_support") return await showSupport(env, chatId, messageId);
+  if (data === "show_ad") {
+    const sent = await sendAdToUser(env.BOT_TOKEN, chatId, user || { id: userId }, "ar", env.ADEXIUM_WID);
+    if (!sent) {
+      await sendMessage(env.BOT_TOKEN, chatId,
+        "📢 عذرًا، لا توجد إعلانات متاحة حاليًا. جرّب مرة أخرى لاحقًا.",
+        { inline_keyboard: [[{ text: "🏠 الرجوع للرئيسية", callback_data: "main_menu" }]] });
+    }
+    return;
+  }
 
   // ===== لوحة الأدمن =====
   if (data === "admin_back") return await editAdminPanel(env, chatId, messageId);
@@ -255,8 +305,16 @@ async function routeCallback(env, chatId, messageId, userId, user, data, callbac
   if (data === "admin_pkg_add_stars") return await startAddPackage(env, chatId, messageId, "stars", userId);
   if (data === "admin_pkg_add_premium") return await startAddPackage(env, chatId, messageId, "premium", userId);
   if (data === "admin_services") return await showAdminServices(env, chatId, messageId);
-  if (data === "admin_svc_list") return await listServices(env, chatId, messageId);
-  if (data === "admin_svc_edit_desc") return await startEditServiceDescription(env, chatId, messageId, userId);
+  if (data === "admin_svc_list" || data.startsWith("admin_svc_list_")) {
+    const page = data === "admin_svc_list" ? 0 : Number(data.slice("admin_svc_list_".length)) || 0;
+    return await listServices(env, chatId, messageId, page);
+  }
+  if (data === "admin_svc_edit_desc") return await listServices(env, chatId, messageId, 0);
+  if (data.startsWith("admin_svc_editdesc_")) return await startEditServiceDescription(env, chatId, messageId, userId, Number(data.slice("admin_svc_editdesc_".length)));
+  if (data.startsWith("admin_svc_delete_confirm_")) return await confirmServiceRemoval(env, chatId, messageId, Number(data.slice("admin_svc_delete_confirm_".length)));
+  if (data.startsWith("admin_svc_delete_cancel_")) return await cancelServiceRemoval(env, chatId, messageId);
+  if (data.startsWith("admin_svc_delete_")) return await requestServiceRemoval(env, chatId, messageId, Number(data.slice("admin_svc_delete_".length)));
+  if (data.startsWith("admin_svc_activate_")) return await reactivateService(env, chatId, messageId, Number(data.slice("admin_svc_activate_".length)));
   if (data === "admin_svc_add") return await startAddService(env, chatId, messageId, userId);
   if (data === "admin_channels") return await showAdminChannels(env, chatId, messageId);
   if (data === "admin_ch_add") return await startAddChannel(env, chatId, messageId, userId);
@@ -382,6 +440,7 @@ async function showMainMenu(env, chatId, messageId, user, isNew = false) {
       [{ text: "👻 سناب شات", callback_data: "smm_snapchat" }, { text: "🐦 X", callback_data: "smm_twitter" }],
       [{ text: "▶️ يوتيوب", callback_data: "smm_youtube" }, { text: "🎁 دعوة أصدقاء", callback_data: "menu_referral" }],
       [{ text: "👤 حسابي", callback_data: "menu_account" }, { text: "📢 قناتنا", callback_data: "menu_channels" }],
+      [{ text: "📢 إعلانات وعروض", callback_data: "show_ad" }],
       [{ text: "ℹ️ عن المتجر", callback_data: "menu_about" }, { text: "💬 الدعم", callback_data: "menu_support" }]
     ]
   };
@@ -666,8 +725,7 @@ async function showSmmCategory(env, chatId, messageId, category) {
   const rows = [];
   if (results && results.length > 0) {
     for (const s of results) {
-      const content = getSmmServiceContent(s.name, s.description);
-      rows.push([{ text: content.title.slice(0, 34) + " - " + Number(s.sell_price_iqd).toLocaleString() + " د.ع", callback_data: "svc_" + s.id }]);
+      rows.push([{ text: String(s.name || "خدمة SMM") + " - " + Number(s.sell_price_iqd).toLocaleString() + " د.ع", callback_data: "svc_" + s.id }]);
     }
   } else {
     text = "📣 <b>خدمات " + catName + "</b>\n\n⏳ قيد التجهيز";
@@ -917,8 +975,7 @@ async function showAdminServices(env, chatId, messageId) {
 
   const kb = {
     inline_keyboard: [
-      [{ text: "📋 عرض", callback_data: "admin_svc_list" }, { text: "➕ إضافة", callback_data: "admin_svc_add" }],
-      [{ text: "✏️ تعديل شرح خدمة", callback_data: "admin_svc_edit_desc" }],
+      [{ text: "📋 عرض/تعديل/حذف", callback_data: "admin_svc_list" }, { text: "➕ إضافة", callback_data: "admin_svc_add" }],
       [{ text: "➕ استيراد عبر Service ID", callback_data: "admin_smm_add_id" }],
       [{ text: "⬅️ رجوع", callback_data: "admin_back" }]
     ]
@@ -926,39 +983,108 @@ async function showAdminServices(env, chatId, messageId) {
   await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
 }
 
-async function listServices(env, chatId, messageId) {
-  const { results } = await env.DB.prepare("SELECT * FROM smm_services ORDER BY category, sort_order, id").all();
-  let text = "📋 <b>الخدمات</b>\n━━━━━━━━━━━━━━━━━━\n\n";
+function clipServiceLabel(value, max = 100) {
+  const chars = Array.from(String(value ?? ""));
+  return chars.length > max ? chars.slice(0, max - 1).join("") + "…" : chars.join("");
+}
 
-  if (!results || results.length === 0) {
-    text += "لا توجد خدمات بعد.";
+async function listServices(env, chatId, messageId, page = 0) {
+  const { results } = await env.DB.prepare("SELECT * FROM smm_services ORDER BY category, sort_order, id").all();
+  const services = results || [];
+  const pageSize = 5;
+  const pageCount = Math.max(1, Math.ceil(services.length / pageSize));
+  const safePage = Math.min(Math.max(0, Number(page) || 0), pageCount - 1);
+  const visible = services.slice(safePage * pageSize, (safePage + 1) * pageSize);
+  let text = "📋 <b>الخدمات</b>\n━━━━━━━━━━━━━━━━━━\n\n";
+  text += "اختر زر <b>شرح</b> لتعديل الوصف أو <b>حذف</b> لإزالة الخدمة من المتجر.\n";
+  text += "الخدمة المرتبطة بطلبات سابقة تُخفى فقط؛ وغير المرتبطة تُحذف نهائيًا.\n\n";
+  text += "الصفحة " + (safePage + 1) + "/" + pageCount + " — الإجمالي: " + services.length + "\n";
+
+  const rows = [];
+  if (!services.length) {
+    text += "\nلا توجد خدمات بعد.";
   } else {
-    let currentCat = "";
-    for (const s of results) {
-      if (s.category !== currentCat) {
-        currentCat = s.category;
-        text += "\n📁 <b>" + escapeHtml(currentCat) + "</b>\n";
-      }
-      const content = getSmmServiceContent(s.name, s.description);
-      text += (s.is_active ? "✅" : "❌") + " <b>#" + s.id + " " + escapeHtml(content.title) + "</b> - " + Number(s.sell_price_iqd).toLocaleString() + " د.ع\n";
-      if (Number(s.provider_rate_usd) > 0) text += "   تكلفة المزود: $" + Number(s.provider_rate_usd).toFixed(4) + " لكل 1000\n";
-      text += "🗑 <code>/delsvc " + s.id + "</code>\n";
+    for (const service of visible) {
+      text += "\n" + (service.is_active ? "✅" : "⏸") + " <b>#" + service.id + " " + escapeHtml(clipServiceLabel(service.name, 100)) + "</b>\n";
+      text += "💵 " + Number(service.sell_price_iqd || 0).toLocaleString() + " د.ع لكل 1000\n";
+      rows.push([
+        { text: "✏️ شرح #" + service.id, callback_data: "admin_svc_editdesc_" + service.id },
+        service.is_active
+          ? { text: "🗑 حذف #" + service.id, callback_data: "admin_svc_delete_" + service.id }
+          : { text: "↩️ إظهار #" + service.id, callback_data: "admin_svc_activate_" + service.id }
+      ]);
     }
   }
 
-  const kb = {
-    inline_keyboard: [
-      [{ text: "➕ إضافة", callback_data: "admin_svc_add" }, { text: "⬅️ رجوع", callback_data: "admin_services" }]
-    ]
-  };
-  await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
+  const nav = [];
+  if (safePage > 0) nav.push({ text: "⬅️ السابق", callback_data: "admin_svc_list_" + (safePage - 1) });
+  if (safePage < pageCount - 1) nav.push({ text: "التالي ➡️", callback_data: "admin_svc_list_" + (safePage + 1) });
+  if (nav.length) rows.push(nav);
+  rows.push([{ text: "➕ إضافة", callback_data: "admin_svc_add" }, { text: "⬅️ رجوع", callback_data: "admin_services" }]);
+  await editMessage(env.BOT_TOKEN, chatId, messageId, text, { inline_keyboard: rows });
 }
 
-async function startEditServiceDescription(env, chatId, messageId, userId) {
-  await setAdminState(env, userId, { action: "edit_smm_description", step: "service_id", data: {} });
-  await editMessage(env.BOT_TOKEN, chatId, messageId,
-    "✏️ <b>تعديل شرح خدمة</b>\n━━━━━━━━━━━━━━━━━━\n\nأرسل الرقم الداخلي للخدمة من قائمة الخدمات (الرقم الظاهر بجانب اسمها أو في أمر <code>/delsvc</code>).\nبعدها أرسل الشرح الجديد الذي سيظهر للمستخدم في تفاصيل الخدمة.\n\nللإلغاء أرسل /cancel.",
-    { inline_keyboard: [[{ text: "❌ إلغاء", callback_data: "admin_services" }]] });
+async function startEditServiceDescription(env, chatId, messageId, userId, serviceId) {
+  const service = await env.DB.prepare("SELECT * FROM smm_services WHERE id = ?").bind(serviceId).first();
+  if (!service) {
+    const text = "❌ لم أجد خدمة بهذا الرقم.";
+    const keyboard = { inline_keyboard: [[{ text: "⬅️ قائمة الخدمات", callback_data: "admin_svc_list" }]] };
+    return messageId ? editMessage(env.BOT_TOKEN, chatId, messageId, text, keyboard) : sendMessage(env.BOT_TOKEN, chatId, text, keyboard);
+  }
+
+  const current = getSmmServiceContent(service.name, service.description).description;
+  await setAdminState(env, userId, { action: "edit_smm_description", step: "description", data: { service_id: service.id, service_name: service.name } });
+  const text = "✏️ <b>تعديل شرح الخدمة #" + service.id + "</b>\n📌 " + escapeHtml(clipServiceLabel(service.name, 180)) + "\n\n<b>الشرح الحالي:</b>\n" + (current ? escapeHtml(current.slice(0, 700)) : "لا يوجد شرح حاليًا") + "\n\nأرسل الشرح الجديد الآن (حتى 2000 حرف). أرسله كنص عادي؛ وللإلغاء أرسل /cancel.";
+  const keyboard = { inline_keyboard: [[{ text: "❌ إلغاء", callback_data: "admin_services" }]] };
+  return messageId ? editMessage(env.BOT_TOKEN, chatId, messageId, text, keyboard) : sendMessage(env.BOT_TOKEN, chatId, text, keyboard);
+}
+
+async function requestServiceRemoval(env, chatId, messageId, serviceId) {
+  const service = await env.DB.prepare("SELECT * FROM smm_services WHERE id = ?").bind(serviceId).first();
+  if (!service) {
+    const text = "❌ لم أجد خدمة بهذا الرقم.";
+    const keyboard = { inline_keyboard: [[{ text: "⬅️ قائمة الخدمات", callback_data: "admin_svc_list" }]] };
+    return messageId ? editMessage(env.BOT_TOKEN, chatId, messageId, text, keyboard) : sendMessage(env.BOT_TOKEN, chatId, text, keyboard);
+  }
+  if (!service.is_active) {
+    const text = "ℹ️ الخدمة مخفية مسبقًا عن المشترين.";
+    const keyboard = { inline_keyboard: [[{ text: "↩️ إظهار الخدمة", callback_data: "admin_svc_activate_" + service.id }], [{ text: "⬅️ قائمة الخدمات", callback_data: "admin_svc_list" }]] };
+    return messageId ? editMessage(env.BOT_TOKEN, chatId, messageId, text, keyboard) : sendMessage(env.BOT_TOKEN, chatId, text, keyboard);
+  }
+  const text = "⚠️ <b>تأكيد حذف الخدمة</b>\n\n📌 #" + service.id + " " + escapeHtml(clipServiceLabel(service.name, 180)) + "\n\nإذا لم تكن عليها طلبات سابقة فستُحذف نهائيًا. وإذا كانت مرتبطة بطلبات فسيتم إخفاؤها فقط لحفظ سجل الطلبات. هل تريد المتابعة؟";
+  const keyboard = { inline_keyboard: [[{ text: "✅ نعم، احذفها من المتجر", callback_data: "admin_svc_delete_confirm_" + service.id }], [{ text: "❌ إلغاء", callback_data: "admin_svc_delete_cancel_" + service.id }]] };
+  return messageId ? editMessage(env.BOT_TOKEN, chatId, messageId, text, keyboard) : sendMessage(env.BOT_TOKEN, chatId, text, keyboard);
+}
+
+async function confirmServiceRemoval(env, chatId, messageId, serviceId) {
+  if (!Number.isSafeInteger(serviceId) || serviceId <= 0) return await editMessage(env.BOT_TOKEN, chatId, messageId, "❌ رقم الخدمة غير صالح.");
+  const service = await env.DB.prepare("SELECT * FROM smm_services WHERE id = ?").bind(serviceId).first();
+  if (!service || !service.is_active) {
+    return await editMessage(env.BOT_TOKEN, chatId, messageId, "ℹ️ الخدمة غير موجودة أو مخفية مسبقًا.", { inline_keyboard: [[{ text: "⬅️ قائمة الخدمات", callback_data: "admin_svc_list" }]] });
+  }
+  const usage = await env.DB.prepare("SELECT COUNT(*) AS c FROM orders WHERE service_id = ?").bind(serviceId).first();
+  const hasHistory = Number(usage?.c || 0) > 0;
+  const result = hasHistory
+    ? await env.DB.prepare("UPDATE smm_services SET is_active = 0 WHERE id = ? AND is_active = 1").bind(serviceId).run()
+    : await env.DB.prepare("DELETE FROM smm_services WHERE id = ? AND is_active = 1").bind(serviceId).run();
+  if (!result?.meta?.changes) {
+    return await editMessage(env.BOT_TOKEN, chatId, messageId, "ℹ️ لم يتغير السجل؛ ربما عولج الطلب مسبقًا.", { inline_keyboard: [[{ text: "⬅️ قائمة الخدمات", callback_data: "admin_svc_list" }]] });
+  }
+  return await editMessage(env.BOT_TOKEN, chatId, messageId,
+    hasHistory ? "✅ أُخفيت الخدمة عن المشترين لأن لها طلبات سابقة؛ احتفظت ببياناتها لحماية سجل الطلبات." : "✅ تم حذف الخدمة نهائيًا من المتجر.",
+    { inline_keyboard: [[{ text: "📋 قائمة الخدمات", callback_data: "admin_svc_list" }], [{ text: "🛍 إدارة الخدمات", callback_data: "admin_services" }]] });
+}
+
+async function cancelServiceRemoval(env, chatId, messageId) {
+  return await editMessage(env.BOT_TOKEN, chatId, messageId, "✅ تم إلغاء الحذف؛ لم يتغير شيء.", {
+    inline_keyboard: [[{ text: "📋 قائمة الخدمات", callback_data: "admin_svc_list" }], [{ text: "⬅️ إدارة الخدمات", callback_data: "admin_services" }]]
+  });
+}
+
+async function reactivateService(env, chatId, messageId, serviceId) {
+  const result = await env.DB.prepare("UPDATE smm_services SET is_active = 1 WHERE id = ? AND is_active = 0").bind(serviceId).run();
+  if (!result?.meta?.changes) return await editMessage(env.BOT_TOKEN, chatId, messageId, "ℹ️ الخدمة غير موجودة أو مفعّلة بالفعل.", { inline_keyboard: [[{ text: "📋 قائمة الخدمات", callback_data: "admin_svc_list" }]] });
+  return await editMessage(env.BOT_TOKEN, chatId, messageId, "✅ تمت إعادة إظهار الخدمة للمشترين.", { inline_keyboard: [[{ text: "📋 قائمة الخدمات", callback_data: "admin_svc_list" }]] });
 }
 
 async function startAddService(env, chatId, messageId, userId) {
@@ -1073,30 +1199,7 @@ async function handleAdminInput(env, chatId, userId, text, state) {
   const data = state.data || {};
 
   // ===== تعديل شرح خدمة SMM =====
-  if (state.action === "edit_smm_description") {
-    if (state.step === "service_id") {
-      const serviceId = parseSmmIqd(text);
-      if (!Number.isSafeInteger(serviceId) || serviceId <= 0) {
-        await sendMessage(env.BOT_TOKEN, chatId, "❌ أدخل الرقم الداخلي للخدمة كما يظهر في قائمة الخدمات.");
-        return true;
-      }
-      const service = await env.DB.prepare("SELECT * FROM smm_services WHERE id = ?").bind(serviceId).first();
-      if (!service) {
-        await sendMessage(env.BOT_TOKEN, chatId, "❌ لم أجد خدمة بهذا الرقم. راجع قائمة الخدمات ثم أرسل الرقم الصحيح.");
-        return true;
-      }
-      const current = getSmmServiceContent(service.name, service.description).description;
-      data.service_id = service.id;
-      data.service_name = service.name;
-      state.step = "description";
-      state.data = data;
-      await setAdminState(env, userId, state);
-      await sendMessage(env.BOT_TOKEN, chatId,
-        "✏️ <b>تعديل شرح الخدمة #" + service.id + "</b>\n📌 " + escapeHtml(getSmmServiceContent(service.name, service.description).title) + "\n\n<b>الشرح الحالي:</b>\n" + (current ? escapeHtml(current.slice(0, 700)) : "لا يوجد شرح حاليًا") + "\n\nأرسل الشرح الجديد الآن (حتى 2000 حرف). أرسله كنص عادي؛ وللإلغاء أرسل /cancel.");
-      return true;
-    }
-
-    if (state.step === "description") {
+  if (state.action === "edit_smm_description" && state.step === "description") {
       const description = text.trim();
       if (!description) {
         await sendMessage(env.BOT_TOKEN, chatId, "❌ الشرح لا يمكن أن يكون فارغًا. أرسل نصًا أو استخدم /cancel.");
@@ -1110,13 +1213,12 @@ async function handleAdminInput(env, chatId, userId, text, state) {
         await env.DB.prepare("UPDATE smm_services SET description = ? WHERE id = ?").bind(description, data.service_id).run();
         await clearAdminState(env, userId);
         await sendMessage(env.BOT_TOKEN, chatId,
-          "✅ <b>تم تحديث شرح الخدمة #" + data.service_id + "</b>\n📌 " + escapeHtml(getSmmServiceContent(data.service_name, description).title) + "\n\n📝 " + escapeHtml(description));
+          "✅ <b>تم تحديث شرح الخدمة #" + data.service_id + "</b>\n📌 " + escapeHtml(data.service_name || "الخدمة") + "\n\n📝 " + escapeHtml(description));
       } catch (e) {
         console.error("editSmmDescription:", e);
         await sendMessage(env.BOT_TOKEN, chatId, "❌ تعذر حفظ الشرح. أعد إرسال النص أو أرسل /cancel.");
       }
       return true;
-    }
   }
 
   // ===== استيراد خدمة SMM بالمعرّف =====
@@ -1466,37 +1568,13 @@ async function showPackageDetails(env, chatId, messageId, pkgId) {
 }
 
 function getSmmServiceContent(name, description) {
-  const rawName = String(name ?? "").trim().replace(/\s+/g, " ");
+  const rawName = String(name ?? "").trim();
   const rawDescription = String(description ?? "").trim();
   const genericDescription = /^(default|standard|normal|package|manual|custom\s+(comments?|requests?)|subscription(?:s)?)\b/i.test(rawDescription);
-  const providerDescription = genericDescription ? "" : rawDescription;
+  let fullDescription = genericDescription ? "" : rawDescription;
   const bracketDetails = [...rawName.matchAll(/\[([^\]]+)\]/g)].map(match => match[1].trim()).filter(Boolean);
-  let title = rawName.replace(/\s*\[[^\]]*\]/g, " ").replace(/\s+/g, " ").trim();
-  let nameDetails = bracketDetails.join("\n");
-
-  if (!bracketDetails.length) {
-    const separated = rawName.match(/^(.{3,80}?)(?:\s+[|—–-]\s+)(.{8,})$/);
-    if (separated) {
-      title = separated[1].trim();
-      nameDetails = separated[2].trim();
-    } else if (title.length > 100) {
-      let splitAt = title.lastIndexOf(" ", 90);
-      if (splitAt < 35) splitAt = 90;
-      nameDetails = title.slice(splitAt).trim();
-      title = title.slice(0, splitAt).trim();
-    }
-  }
-
-  if (!title) title = "خدمة SMM";
-  if (title.length > 100) {
-    const extra = title.slice(95).trim();
-    nameDetails = [extra, nameDetails].filter(Boolean).join("\n");
-    title = title.slice(0, 95).trim();
-  }
-  const parts = [providerDescription, nameDetails].filter(Boolean);
-  let fullDescription = parts.join("\n\n");
-  if (!fullDescription && rawName && title !== rawName) fullDescription = rawName;
-  return { title, description: fullDescription.slice(0, 2000) };
+  if (!fullDescription && bracketDetails.length) fullDescription = bracketDetails.join("\n");
+  return { title: rawName || "خدمة SMM", description: fullDescription.slice(0, 2000) };
 }
 
 async function showServiceDetails(env, chatId, messageId, svcId) {
@@ -2007,6 +2085,7 @@ async function fetchAndShowSmmCategories(env, chatId, messageId) {
   await editMessage(env.BOT_TOKEN, chatId, messageId, "⏳ جاري جلب الخدمات من API...\n\nانتظر قليلاً...");
   const result = await fetchSmmServicesFromApi(env);
   if (!result.ok) return await editMessage(env.BOT_TOKEN, chatId, messageId, "❌ <b>فشل الجلب</b>\n\n" + escapeHtml(result.error), { inline_keyboard: [[{ text: "🔄 إعادة المحاولة", callback_data: "admin_smm_fetch" }], [{ text: "⬅️ رجوع", callback_data: "admin_smm_sync" }]] });
+  await restoreExistingSmmTitles(env, result.services);
   await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind("smm_sync_cache", JSON.stringify(result.services)).run();
   const counts = {};
   for (const service of result.services) { const category = service.category || "غير مصنف"; counts[category] = (counts[category] || 0) + 1; }
@@ -2021,6 +2100,19 @@ async function fetchAndShowSmmCategories(env, chatId, messageId) {
 async function getSmmSyncCache(env) {
   const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind("smm_sync_cache").first();
   try { return row ? JSON.parse(row.value) : null; } catch { return null; }
+}
+
+async function restoreExistingSmmTitles(env, providerServices) {
+  const { results } = await env.DB.prepare("SELECT id, smmcp_service_id, name FROM smm_services WHERE smmcp_service_id NOT LIKE 'manual_%'").all();
+  if (!results?.length) return;
+  const byId = new Map((providerServices || []).map(service => [String(service.service), service]));
+  for (const stored of results) {
+    const provider = byId.get(String(stored.smmcp_service_id));
+    const originalName = String(provider?.name || "").trim();
+    if (originalName && originalName !== stored.name) {
+      await env.DB.prepare("UPDATE smm_services SET name = ? WHERE id = ?").bind(originalName, stored.id).run();
+    }
+  }
 }
 
 async function showSmmCategoryServices(env, chatId, messageId, categoryIndex, page = 0) {
@@ -2044,6 +2136,7 @@ async function showSmmCategoryServices(env, chatId, messageId, categoryIndex, pa
 async function fetchSmmServiceById(env, serviceId) {
   const result = await fetchSmmServicesFromApi(env);
   if (!result.ok) return result;
+  await restoreExistingSmmTitles(env, result.services);
   const service = result.services.find(item => String(item.service) === String(serviceId));
   return service ? { ok: true, service } : { ok: false, error: "لم أعثر على Service ID " + serviceId + " في قائمة خدمات SMMCPAN" };
 }
@@ -2057,8 +2150,14 @@ async function beginSmmServiceImport(env, chatId, userId, service, messageId = n
     return await sendMessage(env.BOT_TOKEN, chatId, text);
   }
 
+  const providerDescription = service.description || service.desc || service.details || service.type || "";
+  const content = getSmmServiceContent(service.name, providerDescription);
   const existing = await env.DB.prepare("SELECT * FROM smm_services WHERE smmcp_service_id = ?").bind(serviceId).first();
   if (existing) {
+    if (existing.name !== content.title) {
+      await env.DB.prepare("UPDATE smm_services SET name = ? WHERE id = ?").bind(content.title, existing.id).run();
+      existing.name = content.title;
+    }
     const text = "⚠️ <b>الخدمة مضافة مسبقًا</b>\n\n📌 " + escapeHtml(existing.name) + "\n💵 سعر البيع: " + Number(existing.sell_price_iqd).toLocaleString() + " د.ع";
     const kb = { inline_keyboard: [
       [{ text: existing.is_active ? "👁 إخفاء" : "✅ إظهار", callback_data: "admin_smm_toggle_" + existing.id + "_" + (categoryIndex ?? 0) }],
@@ -2068,8 +2167,6 @@ async function beginSmmServiceImport(env, chatId, userId, service, messageId = n
     return await sendMessage(env.BOT_TOKEN, chatId, text, kb);
   }
 
-  const providerDescription = service.description || service.desc || service.details || service.type || "";
-  const content = getSmmServiceContent(service.name, providerDescription);
   const description = content.description;
   const minQuantity = Math.max(1, parseInt(service.min, 10) || 100);
   const maxQuantity = Math.max(minQuantity, parseInt(service.max, 10) || 100000);
