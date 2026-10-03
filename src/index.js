@@ -63,7 +63,6 @@ async function handleMessage(msg, env) {
 
   // أمر /start
   if (text === "/start" || text.startsWith("/start ")) {
-    // استخراج كود الإحالة
     const parts = text.split(" ");
     if (parts[1] && parts[1].startsWith("ref_")) {
       const referrerId = parseInt(parts[1].replace("ref_", ""));
@@ -89,7 +88,6 @@ async function handleMessage(msg, env) {
     return;
   }
 
-  // رسالة غير معروفة
   await sendMessage(env.BOT_TOKEN, chatId, "استخدم /start للبدء");
 }
 
@@ -103,14 +101,13 @@ async function handleCallback(query, env) {
   const data = query.data;
   const callbackId = query.id;
 
-  // التحقق من الحظر
   const user = await getUser(env, userId);
   if (user && user.is_blocked === 1) {
     await answerCallback(env.BOT_TOKEN, callbackId, "🚫 أنت محظور", true);
     return;
   }
 
-  // التحقق من الاشتراك (عدا زر التحقق نفسه)
+  // التحقق من الاشتراك (عدا زر التحقق والرئيسية)
   if (data !== "check_subscription" && data !== "main_menu") {
     const subscribed = await checkAllSubscriptions(env, userId);
     if (!subscribed) {
@@ -120,12 +117,11 @@ async function handleCallback(query, env) {
     }
   }
 
-  // توجيه الأزرار
   try {
     await answerCallback(env.BOT_TOKEN, callbackId);
 
     if (data === "check_subscription") {
-      await handleCheckSubscription(env, chatId, userId, messageId, user);
+      await handleCheckSubscription(env, chatId, userId, messageId, user, callbackId);
     } else if (data === "main_menu") {
       await showMainMenu(env, chatId, messageId, user);
     } else if (data === "menu_about") {
@@ -192,17 +188,17 @@ async function checkSubscriptionAndWelcome(env, chatId, userId, firstName, isNew
     return;
   }
 
-  // مشترك بكل القنوات
   const user = await getUser(env, userId);
   await showMainMenu(env, chatId, messageId, user, isNew);
 }
 
-async function handleCheckSubscription(env, chatId, userId, messageId, user) {
+async function handleCheckSubscription(env, chatId, userId, messageId, user, callbackId) {
   const subscribed = await checkAllSubscriptions(env, userId);
   if (!subscribed) {
-    await answerCallback(env.BOT_TOKEN, user?.last_callback || "", "❌ لم تشترك بكل القنوات بعد", true);
+    await answerCallback(env.BOT_TOKEN, callbackId, "❌ لم تشترك بكل القنوات بعد", true);
     return;
   }
+  await answerCallback(env.BOT_TOKEN, callbackId, "✅ تم التحقق");
   await showMainMenu(env, chatId, messageId, user, true);
 }
 
@@ -328,7 +324,6 @@ async function showReferral(env, chatId, messageId, user) {
   await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
 }
 
-// شاشات مؤقتة (راح نكملها لاحقاً)
 async function showStarsMenu(env, chatId, messageId) {
   await editMessage(env.BOT_TOKEN, chatId, messageId, 
     "🛒 <b>شراء نجوم تيليجرام</b>\n\nقيد التطوير 🚧\n\nسيتم عرض الباقات هنا قريباً.",
@@ -426,13 +421,11 @@ async function checkAdmin(env, userId) {
 
 async function saveReferral(env, referrerId, referredId) {
   try {
-    // تأكد أن المستخدم ليس موجود
     const existing = await env.DB.prepare(
       "SELECT * FROM referrals WHERE referred_id = ?"
     ).bind(referredId).first();
     if (existing) return;
 
-    // تأكد أن referrerId موجود
     const referrer = await getUser(env, referrerId);
     if (!referrer) return;
 
