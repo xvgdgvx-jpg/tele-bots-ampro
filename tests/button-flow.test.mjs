@@ -90,6 +90,11 @@ class Statement {
       const u=this.db.users.find(x=>x.id===Number(p[2])); if(u){u.first_name=p[0];u.username=p[1];}
       return this.result(u?1:0);
     }
+    if (q.startsWith('update smm_services set description =')) {
+      const service=this.db.services.find(x=>x.id===Number(p[1]));
+      if(service) service.description=p[0];
+      return this.result(service?1:0);
+    }
     if (q.startsWith('insert into smm_services')) {
       const row=q.includes('provider_rate_usd')
         ? {id:this.db.nextServiceId++,smmcp_service_id:p[0],category:p[1],name:p[2],description:p[3],provider_rate_usd:p[4],sell_price_iqd:p[5],min_quantity:p[6],max_quantity:p[7],is_active:1}
@@ -212,8 +217,9 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
 
   await t.test('admin imports a provider service by ID, selects its category, and sets retail price in IQD', async () => {
     smmServices.splice(0, smmServices.length, {
-      service:101, name:'Instagram Followers', type:'Default', category:'Instagram',
-      description:'High quality followers from SMMCPAN', rate:'0.90', min:'50', max:'10000'
+      service:101,
+      name:'متابعين انستقرام [حسابات عربية حقيقية] [عن طريق الاعلانات] [هام: اغلاق خاصية المراجعة قبل الطلب] [لا يمكن الغاء الطلب بعد وضعه]',
+      type:'Default', category:'Instagram', rate:'0.90', min:'50', max:'10000'
     });
     const before=telegramCalls.length;
     await click(ADMIN,'admin_smm_add_id');
@@ -222,7 +228,7 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     assert.equal(state.action,'add_smm_service');
     assert.equal(state.step,'category');
     const fetchedPrompt=telegramCalls.slice(before).filter(x=>x.method==='sendMessage').at(-1);
-    assert.match(fetchedPrompt.body.text,/High quality followers from SMMCPAN/);
+    assert.match(fetchedPrompt.body.text,/حسابات عربية حقيقية/);
     assert.match(fetchedPrompt.body.text,/\$0\.9000/);
     await click(ADMIN,'admin_smm_import_cat_instagram');
     state=db.settings.get(`admin_state_${ADMIN}`);
@@ -230,13 +236,36 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     await message(ADMIN,'٧٥٠٠');
     const imported=db.services.find(x=>x.smmcp_service_id==='101');
     assert.equal(imported.category,'إنستغرام');
-    assert.equal(imported.name,'Instagram Followers');
-    assert.equal(imported.description,'High quality followers from SMMCPAN');
+    assert.equal(imported.name,'متابعين انستقرام');
+    assert.match(imported.description,/حسابات عربية حقيقية/);
+    assert.doesNotMatch(imported.description,/Default/);
     assert.equal(imported.provider_rate_usd,0.9);
     assert.equal(imported.sell_price_iqd,7500);
     assert.equal(imported.min_quantity,50);
     assert.equal(imported.max_quantity,10000);
     assert.equal(db.settings.has(`admin_state_${ADMIN}`),false);
+
+    let beforeView=telegramCalls.length;
+    await click(USER,`svc_${imported.id}`);
+    let details=telegramCalls.slice(beforeView).find(x=>x.method==='editMessageText');
+    assert.match(details.body.text,/شرح الخدمة/);
+    assert.match(details.body.text,/حسابات عربية حقيقية/);
+    assert.match(details.body.text,/لا يمكن الغاء الطلب بعد وضعه/);
+    assert.doesNotMatch(details.body.text,/📝 Default/);
+
+    await click(ADMIN,'admin_services');
+    await click(ADMIN,'admin_svc_edit_desc');
+    await message(ADMIN,String(imported.id));
+    assert.equal(db.settings.get(`admin_state_${ADMIN}`).step,'description');
+    await message(ADMIN,'متابعون عرب حقيقيون، يرجى إغلاق مراجعة الحساب قبل الطلب.');
+    assert.equal(imported.description,'متابعون عرب حقيقيون، يرجى إغلاق مراجعة الحساب قبل الطلب.');
+    assert.equal(db.settings.has(`admin_state_${ADMIN}`),false);
+
+    beforeView=telegramCalls.length;
+    await click(USER,`svc_${imported.id}`);
+    details=telegramCalls.slice(beforeView).find(x=>x.method==='editMessageText');
+    assert.match(details.body.text,/متابعون عرب حقيقيون/);
+    assert.doesNotMatch(details.body.text,/حسابات عربية حقيقية/);
   });
 
   await t.test('SMM order collects a valid target link and bounded quantity before payment', async () => {

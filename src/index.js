@@ -256,6 +256,7 @@ async function routeCallback(env, chatId, messageId, userId, user, data, callbac
   if (data === "admin_pkg_add_premium") return await startAddPackage(env, chatId, messageId, "premium", userId);
   if (data === "admin_services") return await showAdminServices(env, chatId, messageId);
   if (data === "admin_svc_list") return await listServices(env, chatId, messageId);
+  if (data === "admin_svc_edit_desc") return await startEditServiceDescription(env, chatId, messageId, userId);
   if (data === "admin_svc_add") return await startAddService(env, chatId, messageId, userId);
   if (data === "admin_channels") return await showAdminChannels(env, chatId, messageId);
   if (data === "admin_ch_add") return await startAddChannel(env, chatId, messageId, userId);
@@ -660,12 +661,13 @@ async function showSmmCategory(env, chatId, messageId, category) {
   text += "⚡ تنفيذ سريع\n";
   text += "🛡 ضمان كامل\n\n";
   text += "━━━━━━━━━━━━━━━━━━\n";
-  text += "👇 <b>اختر الخدمة:</b>";
+  text += "👇 <b>اضغط على الخدمة لعرض الشرح الكامل والسعر قبل الطلب:</b>";
 
   const rows = [];
   if (results && results.length > 0) {
     for (const s of results) {
-      rows.push([{ text: s.name + " - " + s.sell_price_iqd.toLocaleString() + " د.ع", callback_data: "svc_" + s.id }]);
+      const content = getSmmServiceContent(s.name, s.description);
+      rows.push([{ text: content.title.slice(0, 34) + " - " + Number(s.sell_price_iqd).toLocaleString() + " د.ع", callback_data: "svc_" + s.id }]);
     }
   } else {
     text = "📣 <b>خدمات " + catName + "</b>\n\n⏳ قيد التجهيز";
@@ -916,6 +918,7 @@ async function showAdminServices(env, chatId, messageId) {
   const kb = {
     inline_keyboard: [
       [{ text: "📋 عرض", callback_data: "admin_svc_list" }, { text: "➕ إضافة", callback_data: "admin_svc_add" }],
+      [{ text: "✏️ تعديل شرح خدمة", callback_data: "admin_svc_edit_desc" }],
       [{ text: "➕ استيراد عبر Service ID", callback_data: "admin_smm_add_id" }],
       [{ text: "⬅️ رجوع", callback_data: "admin_back" }]
     ]
@@ -936,7 +939,8 @@ async function listServices(env, chatId, messageId) {
         currentCat = s.category;
         text += "\n📁 <b>" + escapeHtml(currentCat) + "</b>\n";
       }
-      text += (s.is_active ? "✅" : "❌") + " " + escapeHtml(s.name) + " - " + Number(s.sell_price_iqd).toLocaleString() + " د.ع\n";
+      const content = getSmmServiceContent(s.name, s.description);
+      text += (s.is_active ? "✅" : "❌") + " <b>#" + s.id + " " + escapeHtml(content.title) + "</b> - " + Number(s.sell_price_iqd).toLocaleString() + " د.ع\n";
       if (Number(s.provider_rate_usd) > 0) text += "   تكلفة المزود: $" + Number(s.provider_rate_usd).toFixed(4) + " لكل 1000\n";
       text += "🗑 <code>/delsvc " + s.id + "</code>\n";
     }
@@ -948,6 +952,13 @@ async function listServices(env, chatId, messageId) {
     ]
   };
   await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
+}
+
+async function startEditServiceDescription(env, chatId, messageId, userId) {
+  await setAdminState(env, userId, { action: "edit_smm_description", step: "service_id", data: {} });
+  await editMessage(env.BOT_TOKEN, chatId, messageId,
+    "✏️ <b>تعديل شرح خدمة</b>\n━━━━━━━━━━━━━━━━━━\n\nأرسل الرقم الداخلي للخدمة من قائمة الخدمات (الرقم الظاهر بجانب اسمها أو في أمر <code>/delsvc</code>).\nبعدها أرسل الشرح الجديد الذي سيظهر للمستخدم في تفاصيل الخدمة.\n\nللإلغاء أرسل /cancel.",
+    { inline_keyboard: [[{ text: "❌ إلغاء", callback_data: "admin_services" }]] });
 }
 
 async function startAddService(env, chatId, messageId, userId) {
@@ -1060,6 +1071,53 @@ async function startAddAdmin(env, chatId, messageId, userId) {
 // ============================================
 async function handleAdminInput(env, chatId, userId, text, state) {
   const data = state.data || {};
+
+  // ===== تعديل شرح خدمة SMM =====
+  if (state.action === "edit_smm_description") {
+    if (state.step === "service_id") {
+      const serviceId = parseSmmIqd(text);
+      if (!Number.isSafeInteger(serviceId) || serviceId <= 0) {
+        await sendMessage(env.BOT_TOKEN, chatId, "❌ أدخل الرقم الداخلي للخدمة كما يظهر في قائمة الخدمات.");
+        return true;
+      }
+      const service = await env.DB.prepare("SELECT * FROM smm_services WHERE id = ?").bind(serviceId).first();
+      if (!service) {
+        await sendMessage(env.BOT_TOKEN, chatId, "❌ لم أجد خدمة بهذا الرقم. راجع قائمة الخدمات ثم أرسل الرقم الصحيح.");
+        return true;
+      }
+      const current = getSmmServiceContent(service.name, service.description).description;
+      data.service_id = service.id;
+      data.service_name = service.name;
+      state.step = "description";
+      state.data = data;
+      await setAdminState(env, userId, state);
+      await sendMessage(env.BOT_TOKEN, chatId,
+        "✏️ <b>تعديل شرح الخدمة #" + service.id + "</b>\n📌 " + escapeHtml(getSmmServiceContent(service.name, service.description).title) + "\n\n<b>الشرح الحالي:</b>\n" + (current ? escapeHtml(current.slice(0, 700)) : "لا يوجد شرح حاليًا") + "\n\nأرسل الشرح الجديد الآن (حتى 2000 حرف). أرسله كنص عادي؛ وللإلغاء أرسل /cancel.");
+      return true;
+    }
+
+    if (state.step === "description") {
+      const description = text.trim();
+      if (!description) {
+        await sendMessage(env.BOT_TOKEN, chatId, "❌ الشرح لا يمكن أن يكون فارغًا. أرسل نصًا أو استخدم /cancel.");
+        return true;
+      }
+      if (description.length > 2000) {
+        await sendMessage(env.BOT_TOKEN, chatId, "❌ الشرح أطول من 2000 حرف. اختصره ثم أعد الإرسال.");
+        return true;
+      }
+      try {
+        await env.DB.prepare("UPDATE smm_services SET description = ? WHERE id = ?").bind(description, data.service_id).run();
+        await clearAdminState(env, userId);
+        await sendMessage(env.BOT_TOKEN, chatId,
+          "✅ <b>تم تحديث شرح الخدمة #" + data.service_id + "</b>\n📌 " + escapeHtml(getSmmServiceContent(data.service_name, description).title) + "\n\n📝 " + escapeHtml(description));
+      } catch (e) {
+        console.error("editSmmDescription:", e);
+        await sendMessage(env.BOT_TOKEN, chatId, "❌ تعذر حفظ الشرح. أعد إرسال النص أو أرسل /cancel.");
+      }
+      return true;
+    }
+  }
 
   // ===== استيراد خدمة SMM بالمعرّف =====
   if (state.action === "add_smm_service_id" && state.step === "service_id") {
@@ -1407,6 +1465,40 @@ async function showPackageDetails(env, chatId, messageId, pkgId) {
   await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
 }
 
+function getSmmServiceContent(name, description) {
+  const rawName = String(name ?? "").trim().replace(/\s+/g, " ");
+  const rawDescription = String(description ?? "").trim();
+  const genericDescription = /^(default|standard|normal|package|manual|custom\s+(comments?|requests?)|subscription(?:s)?)\b/i.test(rawDescription);
+  const providerDescription = genericDescription ? "" : rawDescription;
+  const bracketDetails = [...rawName.matchAll(/\[([^\]]+)\]/g)].map(match => match[1].trim()).filter(Boolean);
+  let title = rawName.replace(/\s*\[[^\]]*\]/g, " ").replace(/\s+/g, " ").trim();
+  let nameDetails = bracketDetails.join("\n");
+
+  if (!bracketDetails.length) {
+    const separated = rawName.match(/^(.{3,80}?)(?:\s+[|—–-]\s+)(.{8,})$/);
+    if (separated) {
+      title = separated[1].trim();
+      nameDetails = separated[2].trim();
+    } else if (title.length > 100) {
+      let splitAt = title.lastIndexOf(" ", 90);
+      if (splitAt < 35) splitAt = 90;
+      nameDetails = title.slice(splitAt).trim();
+      title = title.slice(0, splitAt).trim();
+    }
+  }
+
+  if (!title) title = "خدمة SMM";
+  if (title.length > 100) {
+    const extra = title.slice(95).trim();
+    nameDetails = [extra, nameDetails].filter(Boolean).join("\n");
+    title = title.slice(0, 95).trim();
+  }
+  const parts = [providerDescription, nameDetails].filter(Boolean);
+  let fullDescription = parts.join("\n\n");
+  if (!fullDescription && rawName && title !== rawName) fullDescription = rawName;
+  return { title, description: fullDescription.slice(0, 2000) };
+}
+
 async function showServiceDetails(env, chatId, messageId, svcId) {
   const svc = await env.DB.prepare("SELECT * FROM smm_services WHERE id = ?").bind(svcId).first();
   if (!svc) {
@@ -1415,16 +1507,19 @@ async function showServiceDetails(env, chatId, messageId, svcId) {
     });
   }
 
+  const content = getSmmServiceContent(svc.name, svc.description);
   let text = "🛍 <b>تفاصيل الخدمة</b>\n";
   text += "━━━━━━━━━━━━━━━━━━\n\n";
-  text += "📌 <b>" + escapeHtml(svc.name) + "</b>\n";
+  text += "📌 <b>" + escapeHtml(content.title) + "</b>\n";
   text += "📁 الفئة: " + escapeHtml(svc.category) + "\n\n";
-  if (svc.description) {
-    text += "📝 " + escapeHtml(svc.description) + "\n\n";
+  if (content.description) {
+    text += "📝 <b>شرح الخدمة:</b>\n" + escapeHtml(content.description) + "\n\n";
+  } else {
+    text += "📝 <b>شرح الخدمة:</b> لا يتوفر شرح إضافي حاليًا.\n\n";
   }
-  text += "💵 <b>السعر لكل 1000:</b> " + svc.sell_price_iqd.toLocaleString() + " د.ع\n";
-  text += "📊 <b>الحد الأدنى:</b> " + svc.min_quantity.toLocaleString() + "\n";
-  text += "📊 <b>الحد الأقصى:</b> " + svc.max_quantity.toLocaleString() + "\n\n";
+  text += "💵 <b>السعر لكل 1000:</b> " + Number(svc.sell_price_iqd).toLocaleString() + " د.ع\n";
+  text += "📊 <b>الحد الأدنى:</b> " + Number(svc.min_quantity).toLocaleString() + "\n";
+  text += "📊 <b>الحد الأقصى:</b> " + Number(svc.max_quantity).toLocaleString() + "\n\n";
   text += "━━━━━━━━━━━━━━━━━━\n";
   text += "✅ جودة عالية\n";
   text += "⚡ تنفيذ سريع\n";
@@ -1973,12 +2068,14 @@ async function beginSmmServiceImport(env, chatId, userId, service, messageId = n
     return await sendMessage(env.BOT_TOKEN, chatId, text, kb);
   }
 
-  const description = String(service.description || service.desc || service.details || service.type || "").trim().slice(0, 1200);
+  const providerDescription = service.description || service.desc || service.details || service.type || "";
+  const content = getSmmServiceContent(service.name, providerDescription);
+  const description = content.description;
   const minQuantity = Math.max(1, parseInt(service.min, 10) || 100);
   const maxQuantity = Math.max(minQuantity, parseInt(service.max, 10) || 100000);
   const providerService = {
     service_id: serviceId,
-    name: String(service.name).trim().slice(0, 200),
+    name: content.title,
     description,
     provider_rate_usd: rate,
     min_quantity: minQuantity,
