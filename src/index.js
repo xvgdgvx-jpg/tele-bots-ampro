@@ -157,6 +157,20 @@ async function routeCallback(env, chatId, messageId, userId, user, data, callbac
   // ===== الخدمات =====
   if (data === "menu_stars") return await showStarsMenu(env, chatId, messageId);
   if (data === "menu_premium") return await showPremiumMenu(env, chatId, messageId);
+  if (data === "admin_smm_sync") return await startSmmSync(env, chatId, messageId);
+  if (data === "admin_smm_fetch") return await fetchAndShowSmmCategories(env, chatId, messageId);
+  if (data.startsWith("admin_smm_category_")) {
+    const parts = data.slice("admin_smm_category_".length).split("_");
+    return await showSmmCategoryServices(env, chatId, messageId, Number(parts[0]) || 0, Number(parts[1]) || 0);
+  }
+  if (data.startsWith("admin_smm_add_")) {
+    const parts = data.slice("admin_smm_add_".length).split("_");
+    return await addSmmServiceFromCache(env, chatId, messageId, Number(parts[0]), parts.slice(1).join("_"));
+  }
+  if (data.startsWith("admin_smm_toggle_")) {
+    const parts = data.slice("admin_smm_toggle_".length).split("_");
+    return await toggleSmmService(env, chatId, messageId, Number(parts[0]), Number(parts[1]));
+  }
 
   // ===== SMM =====
   if (data.startsWith("smm_")) {
@@ -680,8 +694,8 @@ function adminPanelKb() {
     inline_keyboard: [
       [{ text: "📦 الطلبات", callback_data: "admin_orders" }, { text: "🎁 الهدايا", callback_data: "admin_gifts" }],
       [{ text: "📊 الإحصائيات", callback_data: "admin_stats" }, { text: "⭐ الباقات", callback_data: "admin_packages" }],
-      [{ text: "🛍 الخدمات", callback_data: "admin_services" }, { text: "📢 القنوات", callback_data: "admin_channels" }],
-      [{ text: "👤 الأدمنز", callback_data: "admin_admins" }],
+      [{ text: "🛍 الخدمات", callback_data: "admin_services" }, { text: "🔄 مزامنة SMM", callback_data: "admin_smm_sync" }],
+      [{ text: "📢 القنوات", callback_data: "admin_channels" }, { text: "👤 الأدمنز", callback_data: "admin_admins" }],
       [{ text: "❌ إغلاق", callback_data: "admin_close" }]
     ]
   };
@@ -1785,4 +1799,92 @@ async function clearUserState(env, userId) {
   try {
     await env.DB.prepare("DELETE FROM settings WHERE key = ?").bind("user_state_" + userId).run();
   } catch (e) {}
+}
+
+// ============================================
+// مزامنة خدمات SMMCPAN
+// ============================================
+const SMM_API_URL = "https://smmcpan.com/api/v2";
+
+function calculateSmmPrice(rateUsd) {
+  const rate = Number(rateUsd);
+  if (!Number.isFinite(rate) || rate < 0) return null;
+  return Math.max(1000, Math.ceil((rate * 1900) / 500) * 500);
+}
+
+async function startSmmSync(env, chatId, messageId) {
+  await editMessage(env.BOT_TOKEN, chatId, messageId,
+    "🔄 <b>مزامنة خدمات SMM</b>\n━━━━━━━━━━━━━━━━━━\n\nيجلب هذا القسم الخدمات من SMMCPAN، ثم يحسب السعر بالدينار (الدولار × 1900، تدوير لأعلى إلى 500، والحد الأدنى 1000).\n\n👇 اختر الإجراء:",
+    { inline_keyboard: [[{ text: "🔄 جلب الخدمات من API", callback_data: "admin_smm_fetch" }], [{ text: "⬅️ رجوع", callback_data: "admin_back" }]] });
+}
+
+async function fetchSmmServicesFromApi(env) {
+  if (!env.SMMCPAN_KEY) return { ok: false, error: "المفتاح SMMCPAN_KEY غير مضاف في Cloudflare" };
+  try {
+    const body = new URLSearchParams({ key: env.SMMCPAN_KEY, action: "services" });
+    const response = await fetch(SMM_API_URL, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
+    const raw = await response.text();
+    let data;
+    try { data = JSON.parse(raw); } catch { return { ok: false, error: "رد غير صالح من API (HTTP " + response.status + ")" }; }
+    if (!response.ok || !Array.isArray(data)) return { ok: false, error: "رد غير متوقع من API (HTTP " + response.status + ")" };
+    return { ok: true, services: data.filter(s => s && s.service && s.name && calculateSmmPrice(s.rate) !== null) };
+  } catch (e) { return { ok: false, error: e.message || "تعذر الاتصال بـ API" }; }
+}
+
+async function fetchAndShowSmmCategories(env, chatId, messageId) {
+  await editMessage(env.BOT_TOKEN, chatId, messageId, "⏳ جاري جلب الخدمات من API...\n\nانتظر قليلاً...");
+  const result = await fetchSmmServicesFromApi(env);
+  if (!result.ok) return await editMessage(env.BOT_TOKEN, chatId, messageId, "❌ <b>فشل الجلب</b>\n\n" + escapeHtml(result.error), { inline_keyboard: [[{ text: "🔄 إعادة المحاولة", callback_data: "admin_smm_fetch" }], [{ text: "⬅️ رجوع", callback_data: "admin_smm_sync" }]] });
+  await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind("smm_sync_cache", JSON.stringify(result.services)).run();
+  const counts = {};
+  for (const service of result.services) { const category = service.category || "غير مصنف"; counts[category] = (counts[category] || 0) + 1; }
+  const categories = Object.keys(counts).sort();
+  const rows = [];
+  for (let i = 0; i < categories.length; i += 2) rows.push(categories.slice(i, i + 2).map((category, j) => ({ text: category.slice(0, 24) + " (" + counts[category] + ")", callback_data: "admin_smm_category_" + (i + j) + "_0" })));
+  rows.push([{ text: "⬅️ رجوع", callback_data: "admin_smm_sync" }]);
+  await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind("smm_sync_categories", JSON.stringify(categories)).run();
+  await editMessage(env.BOT_TOKEN, chatId, messageId, "📁 <b>فئات SMM المتاحة</b>\n━━━━━━━━━━━━━━━━━━\n\n📊 إجمالي الخدمات: <b>" + result.services.length + "</b>\n📂 عدد الفئات: <b>" + categories.length + "</b>\n\n👇 اختر فئة:", { inline_keyboard: rows });
+}
+
+async function getSmmSyncCache(env) {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind("smm_sync_cache").first();
+  try { return row ? JSON.parse(row.value) : null; } catch { return null; }
+}
+
+async function showSmmCategoryServices(env, chatId, messageId, categoryIndex, page = 0) {
+  const cache = await getSmmSyncCache(env);
+  const catsRow = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind("smm_sync_categories").first();
+  let categories;
+  try { categories = catsRow ? JSON.parse(catsRow.value) : []; } catch { categories = []; }
+  const category = categories[categoryIndex];
+  if (!cache || !category) return await editMessage(env.BOT_TOKEN, chatId, messageId, "❌ انتهت صلاحية القائمة. اضغط جلب الخدمات مرة أخرى.", { inline_keyboard: [[{ text: "🔄 جلب الخدمات", callback_data: "admin_smm_fetch" }]] });
+  const services = cache.filter(s => (s.category || "غير مصنف") === category);
+  const perPage = 6, totalPages = Math.max(1, Math.ceil(services.length / perPage)), safePage = Math.min(Math.max(0, page), totalPages - 1);
+  const rows = services.slice(safePage * perPage, (safePage + 1) * perPage).map(s => [{ text: String(s.name).slice(0, 38) + " — " + calculateSmmPrice(s.rate).toLocaleString() + " د.ع", callback_data: "admin_smm_add_" + categoryIndex + "_" + String(s.service).replace(/_/g, "-") }]);
+  const nav = [];
+  if (safePage > 0) nav.push({ text: "⬅️ السابق", callback_data: "admin_smm_category_" + categoryIndex + "_" + (safePage - 1) });
+  if (safePage < totalPages - 1) nav.push({ text: "التالي ➡️", callback_data: "admin_smm_category_" + categoryIndex + "_" + (safePage + 1) });
+  if (nav.length) rows.push(nav);
+  rows.push([{ text: "⬅️ رجوع للفئات", callback_data: "admin_smm_fetch" }]);
+  await editMessage(env.BOT_TOKEN, chatId, messageId, "📂 <b>" + escapeHtml(category) + "</b>\n━━━━━━━━━━━━━━━━━━\n\nالخدمات: <b>" + services.length + "</b> | الصفحة: <b>" + (safePage + 1) + "/" + totalPages + "</b>\n\n👇 اختر خدمة:", { inline_keyboard: rows });
+}
+
+async function addSmmServiceFromCache(env, chatId, messageId, categoryIndex, encodedServiceId) {
+  const cache = await getSmmSyncCache(env);
+  const serviceId = String(encodedServiceId).replace(/-/g, "_");
+  const service = cache?.find(s => String(s.service) === serviceId);
+  if (!service) return await editMessage(env.BOT_TOKEN, chatId, messageId, "❌ لم يتم العثور على الخدمة. أعد الجلب.", { inline_keyboard: [[{ text: "🔄 جلب الخدمات", callback_data: "admin_smm_fetch" }]] });
+  const price = calculateSmmPrice(service.rate), category = service.category || "غير مصنف";
+  const existing = await env.DB.prepare("SELECT * FROM smm_services WHERE smmcp_service_id = ?").bind(String(service.service)).first();
+  if (existing) return await editMessage(env.BOT_TOKEN, chatId, messageId, "⚠️ <b>الخدمة مضافة مسبقًا</b>\n\n📌 " + escapeHtml(existing.name) + "\n💵 " + Number(existing.sell_price_iqd).toLocaleString() + " د.ع", { inline_keyboard: [[{ text: existing.is_active ? "👁 إخفاء" : "✅ إظهار", callback_data: "admin_smm_toggle_" + existing.id + "_" + categoryIndex }], [{ text: "⬅️ رجوع للفئة", callback_data: "admin_smm_category_" + categoryIndex + "_0" }]] });
+  await env.DB.prepare("INSERT INTO smm_services (smmcp_service_id, category, name, description, sell_price_iqd, min_quantity, max_quantity, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)").bind(String(service.service), category, service.name, service.type || "", price, parseInt(service.min) || 100, parseInt(service.max) || 100000).run();
+  await editMessage(env.BOT_TOKEN, chatId, messageId, "✅ <b>تمت إضافة الخدمة بنجاح</b>\n\n📌 " + escapeHtml(service.name) + "\n💵 " + price.toLocaleString() + " د.ع لكل 1000\n👁 الخدمة نشطة ومتاحة للمستخدمين.", { inline_keyboard: [[{ text: "⬅️ رجوع للفئة", callback_data: "admin_smm_category_" + categoryIndex + "_0" }]] });
+}
+
+async function toggleSmmService(env, chatId, messageId, id, categoryIndex) {
+  const service = await env.DB.prepare("SELECT * FROM smm_services WHERE id = ?").bind(id).first();
+  if (!service) return await editMessage(env.BOT_TOKEN, chatId, messageId, "❌ الخدمة غير موجودة.");
+  const active = service.is_active ? 0 : 1;
+  await env.DB.prepare("UPDATE smm_services SET is_active = ? WHERE id = ?").bind(active, id).run();
+  await editMessage(env.BOT_TOKEN, chatId, messageId, (active ? "✅ تم إظهار الخدمة" : "👁 تم إخفاء الخدمة") + "\n\n📌 " + escapeHtml(service.name), { inline_keyboard: [[{ text: active ? "👁 إخفاء" : "✅ إظهار", callback_data: "admin_smm_toggle_" + id + "_" + categoryIndex }], [{ text: "⬅️ رجوع للفئة", callback_data: "admin_smm_category_" + categoryIndex + "_0" }]] });
 }
