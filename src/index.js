@@ -26,6 +26,9 @@ export default {
       console.error("Main Error:", e);
     }
     return new Response("OK", { status: 200 });
+  },
+  async scheduled(controller, env) {
+    await pollPendingSmmOrders(env);
   }
 };
 
@@ -66,6 +69,36 @@ async function handleMessage(msg, env) {
       await sendMessage(env.BOT_TOKEN, chatId, "استخدم الأمر بهذا الشكل: <code>/delsvc رقم_الخدمة</code>");
     } else {
       await requestServiceRemoval(env, chatId, null, serviceId);
+    }
+    return;
+  }
+
+  const deletePackageCommand = text.match(/^\/delpkg(?:@\w+)?(?:\s+(\S+))?$/i);
+  if (deletePackageCommand) {
+    if (await checkAdmin(env, userId)) {
+      const packageId = parseSmmIqd(deletePackageCommand[1]);
+      if (!Number.isSafeInteger(packageId) || packageId <= 0) {
+        await sendMessage(env.BOT_TOKEN, chatId, "استخدم الأمر بهذا الشكل: <code>/delpkg رقم_الباقة</code>");
+      } else {
+        await requestPackageRemoval(env, chatId, null, packageId);
+      }
+    } else {
+      await sendMessage(env.BOT_TOKEN, chatId, "🚫 هذا الأمر للأدمن فقط.");
+    }
+    return;
+  }
+
+  const deleteAdminCommand = text.match(/^\/deladmin(?:@\w+)?(?:\s+(\S+))?$/i);
+  if (deleteAdminCommand) {
+    if (!isSuperAdmin(userId)) {
+      await sendMessage(env.BOT_TOKEN, chatId, "🚫 إدارة الأدمن محصورة بالمالك.");
+    } else {
+      const targetId = parseSmmIqd(deleteAdminCommand[1]);
+      if (!Number.isSafeInteger(targetId) || targetId <= 0) {
+        await sendMessage(env.BOT_TOKEN, chatId, "استخدم الأمر بهذا الشكل: <code>/deladmin آيدي_الأدمن</code>");
+      } else {
+        await requestAdminRemoval(env, chatId, null, targetId, userId);
+      }
     }
     return;
   }
@@ -165,6 +198,10 @@ async function handleCallback(query, env) {
   // Admin screens and service-category selection are privileged callbacks.
   if ((data.startsWith("admin_") || data.startsWith("svc_cat_")) && !await checkAdmin(env, userId)) {
     await answerCallback(env.BOT_TOKEN, callbackId, "🚫 هذا الزر للأدمن فقط", true);
+    return;
+  }
+  if ((data === "admin_admins" || data === "admin_add_admin" || data.startsWith("admin_deladmin_")) && !isSuperAdmin(userId)) {
+    await answerCallback(env.BOT_TOKEN, callbackId, "🚫 إدارة الأدمن محصورة بالمالك", true);
     return;
   }
 
@@ -299,6 +336,9 @@ async function routeCallback(env, chatId, messageId, userId, user, data, callbac
     if (Number.isInteger(giftId) && giftId > 0) return await handleGiftDecision(env, chatId, messageId, userId, giftId, "rejected");
   }
   if (data === "admin_close") return await deleteMessage(env.BOT_TOKEN, chatId, messageId);
+  if (data.startsWith("admin_pkg_delete_confirm_")) return await confirmPackageRemoval(env, chatId, messageId, Number(data.slice("admin_pkg_delete_confirm_".length)));
+  if (data.startsWith("admin_pkg_delete_cancel_")) return await cancelPackageRemoval(env, chatId, messageId, Number(data.slice("admin_pkg_delete_cancel_".length)));
+  if (data.startsWith("admin_pkg_delete_")) return await requestPackageRemoval(env, chatId, messageId, Number(data.slice("admin_pkg_delete_".length)));
   if (data === "admin_packages") return await showAdminPackages(env, chatId, messageId);
   if (data === "admin_pkg_list_stars") return await listPackages(env, chatId, messageId, "stars");
   if (data === "admin_pkg_list_premium") return await listPackages(env, chatId, messageId, "premium");
@@ -318,7 +358,10 @@ async function routeCallback(env, chatId, messageId, userId, user, data, callbac
   if (data === "admin_svc_add") return await startAddService(env, chatId, messageId, userId);
   if (data === "admin_channels") return await showAdminChannels(env, chatId, messageId);
   if (data === "admin_ch_add") return await startAddChannel(env, chatId, messageId, userId);
-  if (data === "admin_admins") return await showAdminAdmins(env, chatId, messageId);
+  if (data.startsWith("admin_deladmin_confirm_")) return await confirmAdminRemoval(env, chatId, messageId, Number(data.slice("admin_deladmin_confirm_".length)), userId);
+  if (data.startsWith("admin_deladmin_cancel_")) return await cancelAdminRemoval(env, chatId, messageId, userId);
+  if (data.startsWith("admin_deladmin_")) return await requestAdminRemoval(env, chatId, messageId, Number(data.slice("admin_deladmin_".length)), userId);
+  if (data === "admin_admins") return await showAdminAdmins(env, chatId, messageId, userId);
   if (data === "admin_add_admin") return await startAddAdmin(env, chatId, messageId, userId);
   if (data === "admin_orders") return await showAdminOrders(env, chatId, messageId);
   if (data === "admin_gifts") return await showAdminGifts(env, chatId, messageId);
@@ -935,31 +978,74 @@ async function listPackages(env, chatId, messageId, type) {
   const typeName = type === "stars" ? "النجوم" : "البريميوم";
 
   let text = "📋 <b>باقات " + typeName + "</b>\n━━━━━━━━━━━━━━━━━━\n\n";
+  const rows = [];
   if (!results || results.length === 0) {
     text += "لا توجد باقات بعد.";
   } else {
     for (const p of results) {
       const active = p.is_active ? "✅" : "❌";
       if (type === "stars") {
-        text += active + " <b>" + p.name + "</b>\n";
+        text += active + " <b>" + escapeHtml(p.name) + "</b>\n";
         text += "   ⭐ " + p.stars_amount + " نجمة";
         if (p.bonus_amount > 0) text += " + " + p.bonus_amount + " بونص";
         text += "\n   💵 " + p.price_iqd.toLocaleString() + " د.ع\n";
       } else {
-        text += active + " <b>" + p.name + "</b>\n";
+        text += active + " <b>" + escapeHtml(p.name) + "</b>\n";
         text += "   🌟 " + p.duration_months + " شهر\n";
         text += "   💵 " + p.price_iqd.toLocaleString() + " د.ع\n";
       }
-      text += "   🗑 <code>/delpkg " + p.id + "</code>\n\n";
+      text += "   🗑 حذف: <code>/delpkg " + p.id + "</code>\n\n";
+      rows.push([{ text: "🗑 حذف الباقة #" + p.id, callback_data: "admin_pkg_delete_" + p.id }]);
     }
   }
 
-  const kb = {
-    inline_keyboard: [
-      [{ text: "➕ إضافة", callback_data: "admin_pkg_add_" + type }, { text: "⬅️ رجوع", callback_data: "admin_packages" }]
-    ]
-  };
+  rows.push([{ text: "➕ إضافة", callback_data: "admin_pkg_add_" + type }, { text: "⬅️ رجوع", callback_data: "admin_packages" }]);
+  const kb = { inline_keyboard: rows };
   await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
+}
+
+async function requestPackageRemoval(env, chatId, messageId, packageId) {
+  if (!Number.isSafeInteger(packageId) || packageId <= 0) {
+    const text = "❌ رقم الباقة غير صالح.";
+    return messageId ? editMessage(env.BOT_TOKEN, chatId, messageId, text) : sendMessage(env.BOT_TOKEN, chatId, text);
+  }
+  const pkg = await env.DB.prepare("SELECT * FROM packages WHERE id = ?").bind(packageId).first();
+  if (!pkg) {
+    const text = "❌ لم أجد باقة بهذا الرقم.";
+    return messageId ? editMessage(env.BOT_TOKEN, chatId, messageId, text, { inline_keyboard: [[{ text: "⭐ إدارة الباقات", callback_data: "admin_packages" }]] }) : sendMessage(env.BOT_TOKEN, chatId, text);
+  }
+  const typeName = pkg.type === "stars" ? "النجوم" : "البريميوم";
+  const text = "⚠️ <b>تأكيد حذف باقة " + typeName + "</b>\n\n📦 #" + pkg.id + " — " + escapeHtml(pkg.name) + "\n💵 " + Number(pkg.price_iqd || 0).toLocaleString() + " د.ع\n\nإذا لم ترتبط بطلب سابق فستُحذف نهائيًا. وإذا ارتبطت بطلبات، ستُخفى من المتجر فقط لحفظ سجل الطلبات. هل تريد المتابعة؟";
+  const keyboard = { inline_keyboard: [[{ text: "✅ نعم، احذفها من المتجر", callback_data: "admin_pkg_delete_confirm_" + pkg.id }], [{ text: "❌ إلغاء", callback_data: "admin_pkg_delete_cancel_" + pkg.id }]] };
+  return messageId ? editMessage(env.BOT_TOKEN, chatId, messageId, text, keyboard) : sendMessage(env.BOT_TOKEN, chatId, text, keyboard);
+}
+
+async function confirmPackageRemoval(env, chatId, messageId, packageId) {
+  if (!Number.isSafeInteger(packageId) || packageId <= 0) return await editMessage(env.BOT_TOKEN, chatId, messageId, "❌ رقم الباقة غير صالح.");
+  const pkg = await env.DB.prepare("SELECT * FROM packages WHERE id = ?").bind(packageId).first();
+  if (!pkg) return await editMessage(env.BOT_TOKEN, chatId, messageId, "ℹ️ الباقة غير موجودة أو حُذفت سابقًا.", { inline_keyboard: [[{ text: "⭐ إدارة الباقات", callback_data: "admin_packages" }]] });
+
+  const usage = await env.DB.prepare("SELECT COUNT(*) AS c FROM orders WHERE package_id = ?").bind(packageId).first();
+  await env.DB.prepare("UPDATE packages SET is_active = 0 WHERE id = ? AND is_active = 1").bind(packageId).run();
+  let message;
+  if (Number(usage?.c || 0) > 0) {
+    message = "✅ أُزيلت الباقة من المتجر مع الاحتفاظ بسجلها؛ لأنها مرتبطة بطلبات سابقة.";
+  } else {
+    const removed = await env.DB.prepare("DELETE FROM packages WHERE id = ? AND NOT EXISTS (SELECT 1 FROM orders WHERE package_id = ?)").bind(packageId, packageId).run();
+    if (removed?.meta?.changes) message = "✅ تم حذف الباقة نهائيًا من المتجر.";
+    else {
+      await env.DB.prepare("UPDATE packages SET is_active = 0 WHERE id = ?").bind(packageId).run();
+      message = "✅ أُزيلت الباقة من المتجر مع الاحتفاظ بسجلها؛ ظهر لها طلب أثناء الحذف.";
+    }
+  }
+  return await editMessage(env.BOT_TOKEN, chatId, messageId, message, { inline_keyboard: [[{ text: "📋 قائمة الباقات", callback_data: "admin_pkg_list_" + pkg.type }], [{ text: "⭐ إدارة الباقات", callback_data: "admin_packages" }]] });
+}
+
+async function cancelPackageRemoval(env, chatId, messageId, packageId) {
+  const pkg = await env.DB.prepare("SELECT type FROM packages WHERE id = ?").bind(packageId).first();
+  return pkg
+    ? await listPackages(env, chatId, messageId, pkg.type)
+    : await showAdminPackages(env, chatId, messageId);
 }
 
 async function startAddPackage(env, chatId, messageId, type, userId) {
@@ -1172,34 +1258,69 @@ async function startAddChannel(env, chatId, messageId, userId) {
 // ============================================
 // إدارة الأدمنز
 // ============================================
-async function showAdminAdmins(env, chatId, messageId) {
+async function showAdminAdmins(env, chatId, messageId, userId) {
+  if (!isSuperAdmin(userId)) return await editMessage(env.BOT_TOKEN, chatId, messageId, "🚫 إدارة الأدمن محصورة بالمالك.");
   const { results } = await env.DB.prepare("SELECT * FROM admins ORDER BY created_at").all();
   let text = "👤 <b>الأدمنز</b>\n━━━━━━━━━━━━━━━━━━\n\n";
   text += "👑 <b>المالك:</b> <code>" + SUPER_ADMIN + "</code>\n\n";
+  const rows = [];
   if (!results || results.length === 0) {
     text += "لا يوجد أدمنز إضافيين.";
   } else {
     for (const a of results) {
-      text += "👤 " + (a.name || "بدون اسم") + "\n";
+      if (Number(a.user_id) === SUPER_ADMIN) continue;
+      text += "👤 " + escapeHtml(a.name || "بدون اسم") + "\n";
       text += "   <code>" + a.user_id + "</code>\n";
       text += "   🗑 <code>/deladmin " + a.user_id + "</code>\n\n";
+      rows.push([{ text: "🗑 حذف صلاحية #" + a.user_id, callback_data: "admin_deladmin_" + a.user_id }]);
     }
   }
-  const kb = {
-    inline_keyboard: [
-      [{ text: "➕ إضافة", callback_data: "admin_add_admin" }, { text: "⬅️ رجوع", callback_data: "admin_back" }]
-    ]
-  };
+  rows.push([{ text: "➕ إضافة", callback_data: "admin_add_admin" }, { text: "⬅️ رجوع", callback_data: "admin_back" }]);
+  const kb = { inline_keyboard: rows };
   await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
 }
 
 async function startAddAdmin(env, chatId, messageId, userId) {
+  if (!isSuperAdmin(userId)) return await editMessage(env.BOT_TOKEN, chatId, messageId, "🚫 إضافة الأدمن محصورة بالمالك.");
   await setAdminState(env, userId, { action: "add_admin", step: "user_id", data: {} });
   let text = "➕ <b>إضافة أدمن جديد</b>\n";
   text += "━━━━━━━━━━━━━━━━━━\n\n";
   text += "📝 أرسل آيدي المستخدم";
   const kb = { inline_keyboard: [[{ text: "❌ إلغاء", callback_data: "admin_admins" }]] };
   await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
+}
+
+async function requestAdminRemoval(env, chatId, messageId, targetId, actorId) {
+  if (!isSuperAdmin(actorId)) {
+    const text = "🚫 حذف الأدمن محصور بالمالك.";
+    return messageId ? editMessage(env.BOT_TOKEN, chatId, messageId, text) : sendMessage(env.BOT_TOKEN, chatId, text);
+  }
+  if (!Number.isSafeInteger(targetId) || targetId <= 0 || targetId === SUPER_ADMIN) {
+    const text = "❌ آيدي الأدمن غير صالح أو لا يمكن إزالة صلاحية المالك.";
+    return messageId ? editMessage(env.BOT_TOKEN, chatId, messageId, text) : sendMessage(env.BOT_TOKEN, chatId, text);
+  }
+  const admin = await env.DB.prepare("SELECT * FROM admins WHERE user_id = ?").bind(targetId).first();
+  if (!admin) {
+    const text = "ℹ️ هذا المستخدم ليس أدمنًا مسجلًا.";
+    return messageId ? editMessage(env.BOT_TOKEN, chatId, messageId, text, { inline_keyboard: [[{ text: "👤 قائمة الأدمن", callback_data: "admin_admins" }]] }) : sendMessage(env.BOT_TOKEN, chatId, text);
+  }
+  const text = "⚠️ <b>تأكيد إزالة صلاحية الأدمن</b>\n\n👤 " + escapeHtml(admin.name || "بدون اسم") + "\n🆔 <code>" + targetId + "</code>\n\nبعد التأكيد لن يستطيع هذا الحساب استخدام لوحة الإدارة. هل تريد المتابعة؟";
+  const keyboard = { inline_keyboard: [[{ text: "✅ نعم، أزل الصلاحية", callback_data: "admin_deladmin_confirm_" + targetId }], [{ text: "❌ إلغاء", callback_data: "admin_deladmin_cancel_" + targetId }]] };
+  return messageId ? editMessage(env.BOT_TOKEN, chatId, messageId, text, keyboard) : sendMessage(env.BOT_TOKEN, chatId, text, keyboard);
+}
+
+async function confirmAdminRemoval(env, chatId, messageId, targetId, actorId) {
+  if (!isSuperAdmin(actorId)) return await editMessage(env.BOT_TOKEN, chatId, messageId, "🚫 حذف الأدمن محصور بالمالك.");
+  if (!Number.isSafeInteger(targetId) || targetId <= 0 || targetId === SUPER_ADMIN) return await editMessage(env.BOT_TOKEN, chatId, messageId, "❌ لا يمكن إزالة صلاحية المالك.");
+  const result = await env.DB.prepare("DELETE FROM admins WHERE user_id = ?").bind(targetId).run();
+  if (!result?.meta?.changes) return await editMessage(env.BOT_TOKEN, chatId, messageId, "ℹ️ لم يعد هذا المستخدم أدمنًا.", { inline_keyboard: [[{ text: "👤 قائمة الأدمن", callback_data: "admin_admins" }]] });
+  await clearAdminState(env, targetId);
+  return await editMessage(env.BOT_TOKEN, chatId, messageId, "✅ تمت إزالة صلاحية الأدمن عن <code>" + targetId + "</code>.", { inline_keyboard: [[{ text: "👤 قائمة الأدمن", callback_data: "admin_admins" }], [{ text: "⬅️ لوحة الإدارة", callback_data: "admin_back" }]] });
+}
+
+async function cancelAdminRemoval(env, chatId, messageId, actorId) {
+  if (!isSuperAdmin(actorId)) return await editMessage(env.BOT_TOKEN, chatId, messageId, "🚫 إدارة الأدمن محصورة بالمالك.");
+  return await showAdminAdmins(env, chatId, messageId, actorId);
 }
 
 // ============================================
@@ -1411,14 +1532,21 @@ async function handleAdminInput(env, chatId, userId, text, state) {
 
   // ===== إضافة أدمن =====
   if (state.action === "add_admin" && state.step === "user_id") {
-    const id = parseInt(text);
-    if (isNaN(id)) { await sendMessage(env.BOT_TOKEN, chatId, "❌ آيدي غير صحيح:"); return true; }
+    if (!isSuperAdmin(userId)) {
+      await clearAdminState(env, userId);
+      await sendMessage(env.BOT_TOKEN, chatId, "🚫 إضافة الأدمن محصورة بالمالك.");
+      return true;
+    }
+    const id = parseSmmIqd(text);
+    if (!Number.isSafeInteger(id) || id <= 0 || id === SUPER_ADMIN) { await sendMessage(env.BOT_TOKEN, chatId, "❌ آيدي غير صحيح أو لا يمكن إضافة المالك كأدمن إضافي."); return true; }
     try {
-      await env.DB.prepare(
+      const result = await env.DB.prepare(
         "INSERT OR IGNORE INTO admins (user_id, name, added_by) VALUES (?, ?, ?)"
       ).bind(id, "أدمن", userId).run();
       await clearAdminState(env, userId);
-      await sendMessage(env.BOT_TOKEN, chatId, "✅ تمت إضافة الأدمن بنجاح!");
+      await sendMessage(env.BOT_TOKEN, chatId, result?.meta?.changes
+        ? "✅ تمت إضافة الأدمن بنجاح.\n🆔 <code>" + id + "</code>"
+        : "ℹ️ هذا المستخدم أدمن مسجل مسبقًا.\n🆔 <code>" + id + "</code>");
     } catch (e) {
       await sendMessage(env.BOT_TOKEN, chatId, "❌ خطأ: " + e.message);
     }
@@ -1481,8 +1609,12 @@ async function getActiveChannels(env) {
   } catch (e) { return []; }
 }
 
+function isSuperAdmin(userId) {
+  return Number(userId) === SUPER_ADMIN;
+}
+
 async function checkAdmin(env, userId) {
-  if (userId === SUPER_ADMIN) return true;
+  if (isSuperAdmin(userId)) return true;
   try {
     const admin = await env.DB.prepare("SELECT * FROM admins WHERE user_id = ?").bind(userId).first();
     return !!admin;
@@ -1917,10 +2049,9 @@ async function showSmmProviderOrder(env, chatId, messageId, order, isPhoto = fal
   text += "🔗 الرابط: <code>" + escapeHtml(order.target_link || "") + "</code>\n";
   text += "📊 الكمية: " + Number(order.quantity || 0).toLocaleString() + "\n\n";
   if (note) text += escapeHtml(note) + "\n\n";
-  text += "حدّث حالة التنفيذ من SMMCPAN؛ عند ظهور Completed سيُغلق الطلب ويُبلّغ المشتري تلقائيًا. يمكنك الإكمال اليدوي فقط بعد التأكد من التنفيذ.";
+  text += "يفحص البوت حالة الطلب آليًا كل دقيقة، ولا يبلّغ المشتري بالإكمال إلا إذا أكد الموقع Completed وكان المتبقي صفرًا.";
   const keyboard = { inline_keyboard: [
     [{ text: "🔄 تحديث حالة المزود", callback_data: "admin_smm_status_" + order.id }],
-    [{ text: "✅ تأكيد الإكمال اليدوي", callback_data: "admin_confirm_final_" + order.id }],
     [{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]
   ] };
   return await editAdminOrderMessage(env, chatId, messageId, text, keyboard, isPhoto);
@@ -1987,7 +2118,7 @@ async function adminSubmitSmmOrder(env, chatId, messageId, order, service, isPho
 
   const updated = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(order.id).first();
   await sendMessage(env.BOT_TOKEN, order.user_id,
-    "✅ تمت الموافقة على طلبك وإرساله تلقائيًا إلى مزود الخدمة.\n\n📦 طلب المتجر: <code>" + escapeHtml(order.order_number || ("#" + order.id)) + "</code>\n🆔 رقم التنفيذ لدى المزود: <code>" + escapeHtml(providerOrderId) + "</code>\n⏳ الحالة: قيد التنفيذ؛ سنبلغك عند اكتماله.");
+    "✅ تمت الموافقة على طلبك وبدأ تنفيذ الخدمة.\n\n📦 طلب المتجر: <code>" + escapeHtml(order.order_number || ("#" + order.id)) + "</code>\n⏳ قد يستغرق إكمال طلبك من دقيقة إلى ساعة حسب ضغط الطلبات في الطابور، وسنبلغك فور اكتماله.");
   return await showSmmProviderOrder(env, chatId, messageId, updated || { ...order, smm_order_id: providerOrderId, smm_status: "Submitted" }, isPhoto);
 }
 
@@ -2008,6 +2139,33 @@ async function retrySmmOrderAfterCheck(env, chatId, messageId, orderId, isPhoto 
   return await adminConfirmOrder(env, chatId, messageId, orderId, isPhoto);
 }
 
+function normalizeSmmProviderStatus(data) {
+  const status = String(data?.status || "Unknown").trim().slice(0, 100);
+  const hasRemains = data?.remains !== undefined && data?.remains !== null && String(data.remains).trim() !== "";
+  const remains = hasRemains ? Number(data.remains) : null;
+  const statusCompleted = status.toLowerCase() === "completed";
+  const confirmed = statusCompleted && hasRemains && Number.isFinite(remains) && remains === 0;
+  const storedStatus = statusCompleted && !confirmed
+    ? status + (hasRemains ? " (remaining " + String(data.remains).slice(0, 40) + ")" : " (remaining unavailable)")
+    : status;
+  return { status, remains, hasRemains, confirmed, storedStatus };
+}
+
+function isTerminalSmmProviderStatus(status) {
+  return ["canceled", "cancelled", "partial", "refunded", "failed"].includes(String(status || "").trim().toLowerCase());
+}
+
+async function completeSmmProviderOrder(env, order) {
+  const finalized = await env.DB.prepare(
+    "UPDATE orders SET status = 'completed', completed_at = CURRENT_TIMESTAMP, smm_status = 'Completed' WHERE id = ? AND status = 'pending' AND smm_order_id = ?"
+  ).bind(order.id, String(order.smm_order_id)).run();
+  if (!finalized?.meta?.changes) return false;
+  const orderNumber = escapeHtml(order.order_number || ("#" + order.id));
+  await sendMessage(env.BOT_TOKEN, order.user_id,
+    "✅ <b>تم اكتمال طلبك بنجاح</b>\n\n📦 طلب المتجر: <code>" + orderNumber + "</code>\nشكراً لثقتك بنا 💙");
+  return true;
+}
+
 async function refreshSmmOrderStatus(env, chatId, messageId, orderId, isPhoto = false) {
   const order = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first();
   if (!order || order.status !== "pending" || !order.smm_order_id) {
@@ -2018,14 +2176,74 @@ async function refreshSmmOrderStatus(env, chatId, messageId, orderId, isPhoto = 
     const text = "❌ تعذر جلب حالة الطلب من SMMCPAN: " + String(result.error || "خطأ غير معروف").slice(0, 200);
     return await showSmmProviderOrder(env, chatId, messageId, order, isPhoto, text);
   }
-  const providerStatus = String(result.data?.status || "Unknown").trim().slice(0, 100);
-  await env.DB.prepare("UPDATE orders SET smm_status = ? WHERE id = ? AND status = 'pending' AND smm_order_id = ?").bind(providerStatus, orderId, order.smm_order_id).run();
-  if (providerStatus.toLowerCase() === "completed") return await adminFinalizeOrder(env, chatId, messageId, orderId, isPhoto);
+  const normalized = normalizeSmmProviderStatus(result.data);
+  await env.DB.prepare("UPDATE orders SET smm_status = ? WHERE id = ? AND status = 'pending' AND smm_order_id = ?").bind(normalized.storedStatus, orderId, order.smm_order_id).run();
+  if (normalized.confirmed) {
+    const completed = await completeSmmProviderOrder(env, order);
+    const text = completed
+      ? "✅ أكد الموقع اكتمال الطلب؛ تم تحديث السجل وإبلاغ المشتري."
+      : "ℹ️ الطلب محسوم مسبقًا؛ لم يُرسل إشعار اكتمال مكرر.";
+    return await editAdminOrderMessage(env, chatId, messageId, text, { inline_keyboard: [[{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+  }
 
-  const updated = { ...order, smm_status: providerStatus };
+  const updated = { ...order, smm_status: normalized.storedStatus };
   let note = "باقي لدى المزود: " + String(result.data?.remains ?? "غير متاح");
+  if (normalized.status.toLowerCase() === "completed") note += "\n⚠️ حالة الإكمال غير مؤكدة بالكامل؛ لم نبلغ المشتري ولم نغلق الطلب لأن قيمة المتبقي ليست صفرًا.";
   if (result.data?.charge !== undefined) note += "\nالكلفة المسجلة لدى المزود: $" + String(result.data.charge);
   return await showSmmProviderOrder(env, chatId, messageId, updated, isPhoto, note);
+}
+
+async function pollPendingSmmOrders(env) {
+  if (!env.SMMCPAN_KEY) return;
+  const cursorKey = "smm_status_poll_cursor";
+  const cursorRow = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(cursorKey).first();
+  let cursor = 0;
+  try { cursor = Math.max(0, Number(JSON.parse(cursorRow?.value || "0")) || 0); } catch { cursor = 0; }
+
+  const loadBatch = async (afterId) => {
+    const { results } = await env.DB.prepare(
+      "SELECT id, order_number, user_id, smm_order_id, smm_status FROM orders WHERE status = 'pending' AND type = 'smm' AND smm_order_id IS NOT NULL AND TRIM(smm_order_id) != '' AND LOWER(COALESCE(smm_status, '')) NOT IN ('completed', 'canceled', 'cancelled', 'partial', 'refunded', 'failed') AND id > ? ORDER BY id ASC LIMIT 20"
+    ).bind(afterId).all();
+    return results || [];
+  };
+
+  let batch = await loadBatch(cursor);
+  if (!batch.length && cursor > 0) {
+    cursor = 0;
+    batch = await loadBatch(cursor);
+  }
+  if (!batch.length) {
+    if (cursor > 0) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(cursorKey, JSON.stringify(0)).run();
+    return;
+  }
+
+  const pollOne = async (order) => {
+    try {
+      const result = await requestSmmProvider(env, { action: "status", order: String(order.smm_order_id) });
+      if (!result.ok) {
+        console.error("smmStatusPollFailed", { orderId: order.id, error: result.error });
+        return;
+      }
+      const normalized = normalizeSmmProviderStatus(result.data);
+      const previousStatus = String(order.smm_status || "");
+      const saved = await env.DB.prepare(
+        "UPDATE orders SET smm_status = ? WHERE id = ? AND status = 'pending' AND smm_order_id = ? AND COALESCE(smm_status, '') = ?"
+      ).bind(normalized.storedStatus, order.id, String(order.smm_order_id), previousStatus).run();
+
+      if (normalized.confirmed) {
+        await completeSmmProviderOrder(env, order);
+      } else if (isTerminalSmmProviderStatus(normalized.status) && saved?.meta?.changes) {
+        await sendMessage(env.BOT_TOKEN, SUPER_ADMIN,
+          "⚠️ <b>طلب SMM يحتاج مراجعة</b>\n📦 طلب المتجر: <code>" + escapeHtml(order.order_number || ("#" + order.id)) + "</code>\n🆔 رقم الطلب لدى المزود: <code>" + escapeHtml(order.smm_order_id) + "</code>\nالحالة: <b>" + escapeHtml(normalized.status) + "</b>\nلم يرسل البوت إشعار اكتمال للمشتري.");
+      }
+    } catch (error) {
+      console.error("smmStatusPollError", { orderId: order.id, error: error?.message || String(error) });
+    }
+  };
+
+  for (let i = 0; i < batch.length; i += 5) await Promise.all(batch.slice(i, i + 5).map(pollOne));
+  const nextCursor = Number(batch[batch.length - 1].id) || 0;
+  await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(cursorKey, JSON.stringify(nextCursor)).run();
 }
 
 async function adminConfirmOrder(env, chatId, messageId, orderId, isPhoto = false) {
@@ -2083,6 +2301,15 @@ async function adminBackToOrder(env, chatId, messageId, orderId, isPhoto = false
 async function adminFinalizeOrder(env, chatId, messageId, orderId, isPhoto = false) {
   const order = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first();
   if (!order || order.status !== "pending") return await editAdminOrderMessage(env, chatId, messageId, "⚠️ الطلب غير موجود أو حُسم مسبقًا.", { inline_keyboard: [[{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+  if (order.type === "smm" && order.smm_order_id) {
+    if (String(order.smm_status || "").trim().toLowerCase() !== "completed") {
+      return await editAdminOrderMessage(env, chatId, messageId, "⚠️ لم يؤكد الموقع اكتمال الطلب مع متبقٍ صفر؛ لا يمكن إبلاغ المشتري بالإكمال.", { inline_keyboard: [[{ text: "🔄 تحديث الحالة", callback_data: "admin_smm_status_" + orderId }], [{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+    }
+    const completed = await completeSmmProviderOrder(env, order);
+    return await editAdminOrderMessage(env, chatId, messageId,
+      completed ? "✅ أكد الموقع اكتمال الطلب وتم إبلاغ المشتري." : "ℹ️ سبق حسم الطلب؛ لم يُرسل إشعار مكرر.",
+      { inline_keyboard: [[{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+  }
   if (order.type === "smm" && !order.smm_order_id) {
     const service = await env.DB.prepare("SELECT * FROM smm_services WHERE id = ?").bind(order.service_id).first();
     if (isProviderServiceId(service?.smmcp_service_id)) {

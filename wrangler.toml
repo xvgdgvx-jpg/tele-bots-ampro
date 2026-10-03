@@ -2,6 +2,9 @@ name = "tele-bots-ampro"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
+[triggers]
+crons = ["* * * * *"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "telegram-bot-db"

@@ -47,6 +47,7 @@ class Statement {
     if (q.startsWith('select * from orders where id =')) return this.db.orders.find(x => x.id === Number(p[0])) || null;
     if (q.startsWith('select * from smm_services where id =')) return this.db.services.find(x => x.id === Number(p[0])) || null;
     if (q.startsWith('select * from smm_services where smmcp_service_id =')) return this.db.services.find(x => x.smmcp_service_id === String(p[0])) || null;
+    if (q.includes('count(*)') && q.includes('from orders where package_id =')) return { c:this.db.orders.filter(x=>x.package_id===Number(p[0])).length };
     if (q.includes('count(*)') && q.includes('from orders where service_id =')) return { c:this.db.orders.filter(x=>x.service_id===Number(p[0])).length };
     if (q.startsWith('select * from packages where id =')) return this.db.packages.find(x => x.id === Number(p[0])) || null;
     if (q.startsWith('select * from gift_requests where id =')) return this.db.gifts.find(x => x.id === Number(p[0])) || null;
@@ -74,6 +75,11 @@ class Statement {
     if (q.includes('from gift_requests g left join users')) return { results: this.db.gifts.filter(x => x.status === 'pending').sort((a,b)=>b.id-a.id).slice(0,10).map(x=>({...x, first_name:this.db.users.find(u=>u.id===x.user_id)?.first_name, username:this.db.users.find(u=>u.id===x.user_id)?.username})) };
     if (q.startsWith('select level, status from gift_requests where user_id =')) return { results: this.db.gifts.filter(x => x.user_id === Number(p[0])).map(x=>({level:x.level,status:x.status})) };
     if (q.startsWith('select * from channels where is_active')) return { results: this.db.channels.filter(x => x.is_active) };
+    if (q.startsWith('select * from admins order by')) return { results: this.db.admins };
+    if (q.startsWith("select id, order_number, user_id, smm_order_id, smm_status from orders where status = 'pending'")) {
+      const terminal=new Set(['completed','canceled','cancelled','partial','refunded','failed']);
+      return { results:this.db.orders.filter(x=>x.status==='pending'&&x.type==='smm'&&x.smm_order_id&&Number(x.id)>Number(p[0]||0)&&!terminal.has(String(x.smm_status||'').toLowerCase())).sort((a,b)=>a.id-b.id).slice(0,20) };
+    }
     if (q.startsWith('select * from packages where')) return { results: this.db.packages };
     if (q.startsWith('select id, smmcp_service_id, name from smm_services')) return { results: this.db.services.filter(x=>!String(x.smmcp_service_id).startsWith('manual_')).map(({id,smmcp_service_id,name})=>({id,smmcp_service_id,name})) };
     if (q.includes('from smm_services where category =')) return { results: this.db.services.filter(x=>x.category===p[0]&&x.is_active===1) };
@@ -86,6 +92,31 @@ class Statement {
     const p = this.params;
     if (q.startsWith('insert or replace into settings')) { this.db.settings.set(p[0], JSON.parse(p[1])); return this.result(1); }
     if (q.startsWith('delete from settings')) { const changed = this.db.settings.delete(p[0]); return this.result(changed ? 1 : 0); }
+    if (q.startsWith('insert or ignore into admins')) {
+      if (this.db.admins.some(x=>x.user_id===Number(p[0]))) return this.result(0);
+      this.db.admins.push({user_id:Number(p[0]),name:p[1],added_by:Number(p[2])});
+      return this.result(1);
+    }
+    if (q.startsWith('delete from admins where user_id =')) {
+      const index=this.db.admins.findIndex(x=>x.user_id===Number(p[0]));
+      if(index>=0) this.db.admins.splice(index,1);
+      return this.result(index>=0?1:0);
+    }
+    if (q.startsWith('update packages set is_active = 0 where id = ? and is_active = 1')) {
+      const pkg=this.db.packages.find(x=>x.id===Number(p[0])&&x.is_active===1);
+      if(pkg) pkg.is_active=0;
+      return this.result(pkg?1:0);
+    }
+    if (q.startsWith('update packages set is_active = 0 where id =')) {
+      const pkg=this.db.packages.find(x=>x.id===Number(p[0]));
+      if(pkg) pkg.is_active=0;
+      return this.result(pkg?1:0);
+    }
+    if (q.startsWith('delete from packages where id = ? and not exists')) {
+      const index=this.db.packages.findIndex(x=>x.id===Number(p[0])&&!this.db.orders.some(o=>o.package_id===Number(p[1])));
+      if(index>=0) this.db.packages.splice(index,1);
+      return this.result(index>=0?1:0);
+    }
     if (q.startsWith('insert or ignore into users')) {
       if (!this.db.users.some(x=>x.id===Number(p[0]))) this.db.users.push({id:Number(p[0]),first_name:p[1],username:p[2]});
       return this.result(1);
@@ -131,6 +162,11 @@ class Statement {
       this.db.orders.push({id,order_number,user_id,type,package_id,service_id,target_username,target_link,quantity,stars_amount,bonus_amount,price_iqd,payment_photo_id,status:'pending'});
       return this.result(1,id);
     }
+    if (q.startsWith("update orders set status = 'completed', completed_at = current_timestamp, smm_status = 'completed'")) {
+      const order=this.db.orders.find(x=>x.id===Number(p[0])&&x.status==='pending'&&String(x.smm_order_id)===String(p[1]));
+      if(order){order.status='completed';order.smm_status='Completed';}
+      return this.result(order?1:0);
+    }
     if (q.startsWith('update orders set status = \'completed\'')) {
       const order=this.db.orders.find(x=>x.id===Number(p[0]) && x.status==='pending');
       if(order){order.status='completed';} return this.result(order?1:0);
@@ -166,7 +202,9 @@ class Statement {
       const order=this.db.orders.find(x=>x.id===Number(p[1]));
       const needsProviderId=q.includes('and smm_order_id = ?');
       const expectedExternalId=needsProviderId?String(p[2]):null;
-      const allowed=order&&order.status==='pending'&&(!q.includes("and smm_status = 'submitting'")||order.smm_status==='submitting')&&(!needsProviderId||String(order.smm_order_id)===expectedExternalId);
+      const needsExpectedStatus=q.includes("and coalesce(smm_status, '') = ?");
+      const expectedStatus=needsExpectedStatus?String(p[3]||''):null;
+      const allowed=order&&order.status==='pending'&&(!q.includes("and smm_status = 'submitting'")||order.smm_status==='submitting')&&(!needsProviderId||String(order.smm_order_id)===expectedExternalId)&&(!needsExpectedStatus||String(order.smm_status||'')===expectedStatus);
       if(allowed) order.smm_status=p[0];
       return this.result(allowed?1:0);
     }
@@ -239,6 +277,9 @@ async function message(userId,text) {
 async function photo(userId,fileId='receipt-test') {
   await deliver({message:{message_id:900+callbackNo,chat:{id:userId},from:{id:userId,first_name:'User',username:'testuser'},photo:[{file_id:fileId}]}});
 }
+async function runScheduled() {
+  await worker.scheduled({cron:'* * * * *',scheduledTime:Date.now()},env,{waitUntil:()=>{}});
+}
 
 test('protected buttons, customer order state, admin service flow, and gift/order lifecycle', async t => {
   await t.test('non-admin cannot access the admin queue', async () => {
@@ -247,6 +288,54 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     const calls=telegramCalls.slice(before);
     assert.ok(calls.some(x=>x.method==='answerCallbackQuery' && x.body.show_alert===true));
     assert.equal(calls.some(x=>x.method==='editMessageText' && String(x.body.text).includes('الطلبات المعلقة')),false);
+  });
+
+  await t.test('only the owner can add or remove admins', async () => {
+    db.admins.push({user_id:USER,name:'Subadmin',added_by:ADMIN});
+    let before=telegramCalls.length;
+    await click(USER,'admin_admins');
+    assert.ok(telegramCalls.slice(before).some(x=>x.method==='answerCallbackQuery'&&String(x.body.text).includes('المالك')));
+    before=telegramCalls.length;
+    await click(USER,'admin_add_admin');
+    assert.ok(telegramCalls.slice(before).some(x=>x.method==='answerCallbackQuery'&&x.body.show_alert===true));
+    before=telegramCalls.length;
+    await message(USER,'/deladmin 123456');
+    assert.ok(telegramCalls.slice(before).some(x=>x.method==='sendMessage'&&String(x.body.text).includes('محصورة بالمالك')));
+    db.admins.splice(db.admins.findIndex(x=>x.user_id===USER),1);
+
+    await click(ADMIN,'admin_add_admin');
+    await message(ADMIN,'123456');
+    assert.ok(db.admins.some(x=>x.user_id===123456&&x.added_by===ADMIN));
+    await click(ADMIN,'admin_admins');
+    const adminsView=telegramCalls.filter(x=>x.method==='editMessageText').at(-1);
+    assert.ok(JSON.stringify(adminsView.body.reply_markup).includes('admin_deladmin_123456'));
+    await message(ADMIN,'/deladmin 123456');
+    const confirm=telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===ADMIN).at(-1);
+    assert.match(confirm.body.text,/تأكيد إزالة صلاحية الأدمن/);
+    assert.ok(JSON.stringify(confirm.body.reply_markup).includes('admin_deladmin_confirm_123456'));
+    await click(ADMIN,'admin_deladmin_confirm_123456');
+    assert.equal(db.admins.some(x=>x.user_id===123456),false);
+  });
+
+  await t.test('admin can remove stars and premium packages without losing historical orders', async () => {
+    await click(ADMIN,'admin_pkg_list_stars');
+    const packageList=telegramCalls.filter(x=>x.method==='editMessageText').at(-1);
+    assert.ok(JSON.stringify(packageList.body.reply_markup).includes('admin_pkg_delete_1'));
+    await click(ADMIN,'admin_pkg_delete_1');
+    const confirm=telegramCalls.filter(x=>x.method==='editMessageText').at(-1);
+    assert.match(confirm.body.text,/تأكيد حذف باقة النجوم/);
+    await click(ADMIN,'admin_pkg_delete_confirm_1');
+    assert.ok(db.packages.some(x=>x.id===1),'package row remains for the prior order');
+    assert.equal(db.packages.find(x=>x.id===1).is_active,0,'a package with order history is removed from sale');
+    assert.ok(db.orders.some(x=>x.id===7&&x.package_id===1),'historical order remains intact');
+    db.packages.find(x=>x.id===1).is_active=1;
+
+    db.packages.push({id:2,type:'premium',name:'Premium month',duration_months:1,price_iqd:10000,is_active:1,sort_order:0});
+    await message(ADMIN,'/delpkg 2');
+    const prompt=telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===ADMIN).at(-1);
+    assert.match(prompt.body.text,/تأكيد حذف باقة البريميوم/);
+    await click(ADMIN,'admin_pkg_delete_confirm_2');
+    assert.equal(db.packages.some(x=>x.id===2),false,'an unused premium package is deleted');
   });
 
   await t.test('my_orders shows only the requesting user’s orders', async () => {
@@ -438,10 +527,15 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     assert.equal(order.smm_order_id,'880010');
     assert.equal(order.smm_status,'Submitted');
     assert.equal(order.status,'pending','the shop order remains open while the provider processes it');
-    assert.ok(telegramCalls.some(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تلقائيًا إلى مزود الخدمة')));
+    const acceptedMessage=telegramCalls.find(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تمت الموافقة على طلبك'));
+    assert.ok(acceptedMessage);
+    assert.match(acceptedMessage.body.text,/من دقيقة إلى ساعة/);
+    assert.doesNotMatch(acceptedMessage.body.text,/مزود|SMMCPAN|رقم التنفيذ/);
 
     await click(ADMIN,'admin_confirm_10');
     assert.equal(smmApiCalls.filter(x=>x.action==='add').length,before+1,'repeated admin callbacks must not create a duplicate provider order');
+    await click(ADMIN,'admin_confirm_final_10');
+    assert.equal(order.status,'pending','a provider-backed order cannot be manually completed before provider confirmation');
     smmStatusResponse={charge:'0.12',status:'In progress',remains:'200',start_count:'50',currency:'USD'};
     await click(ADMIN,'admin_smm_status_10');
     assert.equal(smmApiCalls.at(-1).action,'status');
@@ -450,11 +544,13 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     assert.equal(order.status,'pending');
 
     smmStatusResponse={charge:'0.12',status:'Completed',remains:'0',start_count:'250',currency:'USD'};
-    const noticesBefore=telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تم تنفيذ طلبك بنجاح')).length;
+    const noticesBefore=telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تم اكتمال طلبك بنجاح')).length;
     await click(ADMIN,'admin_smm_status_10');
     assert.equal(order.status,'completed');
     assert.equal(order.smm_status,'Completed');
-    assert.equal(telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تم تنفيذ طلبك بنجاح')).length,noticesBefore+1);
+    const completionMessage=telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تم اكتمال طلبك بنجاح')).at(-1);
+    assert.equal(telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تم اكتمال طلبك بنجاح')).length,noticesBefore+1);
+    assert.doesNotMatch(completionMessage.body.text,/مزود|SMMCPAN|رقم التنفيذ/);
     smmStatusResponse={charge:'0.12',status:'In progress',remains:'250',start_count:'0',currency:'USD'};
   });
 
@@ -485,6 +581,35 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     await click(ADMIN,'admin_confirm_final_12');
     assert.equal(order.status,'pending');
     assert.equal(order.smm_order_id,null);
+  });
+
+  await t.test('scheduled polling only notifies the buyer after provider confirms Completed with zero remaining', async () => {
+    const order=db.orders.find(x=>x.id===11);
+    const countNotices=()=>telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تم اكتمال طلبك بنجاح')).length;
+    const before=countNotices();
+    smmStatusResponse={charge:'0.12',status:'Completed',start_count:'299',currency:'USD'};
+    await runScheduled();
+    assert.equal(order.status,'pending','without an explicit zero remainder, completion is not proven');
+    assert.match(order.smm_status,/remaining unavailable/);
+    assert.equal(countNotices(),before);
+
+    smmStatusResponse={charge:'0.12',status:'Completed',remains:'1',start_count:'299',currency:'USD'};
+    await runScheduled();
+    assert.equal(order.status,'pending','a Completed label with a positive remainder is not enough');
+    assert.match(order.smm_status,/remaining 1/);
+    assert.equal(countNotices(),before);
+
+    smmStatusResponse={charge:'0.12',status:'Completed',remains:'0',start_count:'300',currency:'USD'};
+    await runScheduled();
+    assert.equal(order.status,'completed');
+    assert.equal(order.smm_status,'Completed');
+    assert.equal(countNotices(),before+1);
+    const completion=telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تم اكتمال طلبك بنجاح')).at(-1);
+    assert.doesNotMatch(completion.body.text,/SMMCPAN|مزود|رقم التنفيذ/);
+    const apiCallsAfterCompletion=smmApiCalls.filter(x=>x.action==='status').length;
+    await runScheduled();
+    assert.equal(smmApiCalls.filter(x=>x.action==='status').length,apiCallsAfterCompletion,'completed orders stop polling and do not notify twice');
+    smmStatusResponse={charge:'0.12',status:'In progress',remains:'250',start_count:'0',currency:'USD'};
   });
 
   await t.test('admin cancellation resolves once and escapes the reason sent to the customer', async () => {
