@@ -46,6 +46,7 @@ class Statement {
     }
     if (q.startsWith('select * from orders where id =')) return this.db.orders.find(x => x.id === Number(p[0])) || null;
     if (q.startsWith('select * from smm_services where id =')) return this.db.services.find(x => x.id === Number(p[0])) || null;
+    if (q.startsWith('select * from smm_services where smmcp_service_id =')) return this.db.services.find(x => x.smmcp_service_id === String(p[0])) || null;
     if (q.startsWith('select * from packages where id =')) return this.db.packages.find(x => x.id === Number(p[0])) || null;
     if (q.startsWith('select * from gift_requests where id =')) return this.db.gifts.find(x => x.id === Number(p[0])) || null;
     if (q.includes('count(*)') && q.includes('from referrals') && q.includes('has_qualified = 1')) return { c: this.db.referrals.filter(x => x.referrer_id === Number(p[0]) && x.has_qualified === 1).length };
@@ -90,7 +91,9 @@ class Statement {
       return this.result(u?1:0);
     }
     if (q.startsWith('insert into smm_services')) {
-      const row={id:this.db.nextServiceId++,smmcp_service_id:p[0],category:p[1],name:p[2],sell_price_iqd:p[3],min_quantity:p[4],max_quantity:p[5],is_active:1};
+      const row=q.includes('provider_rate_usd')
+        ? {id:this.db.nextServiceId++,smmcp_service_id:p[0],category:p[1],name:p[2],description:p[3],provider_rate_usd:p[4],sell_price_iqd:p[5],min_quantity:p[6],max_quantity:p[7],is_active:1}
+        : {id:this.db.nextServiceId++,smmcp_service_id:p[0],category:p[1],name:p[2],sell_price_iqd:p[3],min_quantity:p[4],max_quantity:p[5],is_active:1};
       this.db.services.push(row); return this.result(1,row.id);
     }
     if (q.startsWith('insert into orders')) {
@@ -131,8 +134,15 @@ class Statement {
 
 const db = new MemoryD1();
 const telegramCalls = [];
+const smmServices = [];
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async (url, init={}) => {
+  if (String(url) === 'https://smmcpan.com/api/v2') {
+    const form = new URLSearchParams(String(init.body));
+    assert.equal(form.get('action'),'services');
+    assert.equal(form.get('key'),'test-smm-key');
+    return new Response(JSON.stringify(smmServices), {status:200,headers:{'content-type':'application/json'}});
+  }
   assert.equal(String(url).startsWith(TG_BASE), true, `unexpected outbound request: ${url}`);
   const method = String(url).split('/').at(-1);
   const body = init.body ? JSON.parse(init.body) : {};
@@ -140,7 +150,7 @@ globalThis.fetch = async (url, init={}) => {
   const result = method === 'getMe' ? {username:'ampro_test_bot'} : {message_id:telegramCalls.length};
   return new Response(JSON.stringify({ok:true,result}), {status:200,headers:{'content-type':'application/json'}});
 };
-const env = {BOT_TOKEN:'test-only-token', DB:db};
+const env = {BOT_TOKEN:'test-only-token', SMMCPAN_KEY:'test-smm-key', DB:db};
 async function deliver(update) {
   const pending=[];
   const response=await worker.fetch(new Request('https://worker.test/',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(update)}),env,{waitUntil:p=>pending.push(p)});
@@ -197,6 +207,35 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     assert.equal(db.services.length,2);
     const added=db.services.find(x=>x.name==='Test Followers');
     assert.deepEqual({category:added.category,name:added.name,price:added.sell_price_iqd,min:added.min_quantity,max:added.max_quantity},{category:'تيليجرام',name:'Test Followers',price:5000,min:100,max:1000});
+    assert.equal(db.settings.has(`admin_state_${ADMIN}`),false);
+  });
+
+  await t.test('admin imports a provider service by ID, selects its category, and sets retail price in IQD', async () => {
+    smmServices.splice(0, smmServices.length, {
+      service:101, name:'Instagram Followers', type:'Default', category:'Instagram',
+      description:'High quality followers from SMMCPAN', rate:'0.90', min:'50', max:'10000'
+    });
+    const before=telegramCalls.length;
+    await click(ADMIN,'admin_smm_add_id');
+    await message(ADMIN,'101');
+    let state=db.settings.get(`admin_state_${ADMIN}`);
+    assert.equal(state.action,'add_smm_service');
+    assert.equal(state.step,'category');
+    const fetchedPrompt=telegramCalls.slice(before).filter(x=>x.method==='sendMessage').at(-1);
+    assert.match(fetchedPrompt.body.text,/High quality followers from SMMCPAN/);
+    assert.match(fetchedPrompt.body.text,/\$0\.9000/);
+    await click(ADMIN,'admin_smm_import_cat_instagram');
+    state=db.settings.get(`admin_state_${ADMIN}`);
+    assert.equal(state.step,'sell_price_iqd');
+    await message(ADMIN,'٧٥٠٠');
+    const imported=db.services.find(x=>x.smmcp_service_id==='101');
+    assert.equal(imported.category,'إنستغرام');
+    assert.equal(imported.name,'Instagram Followers');
+    assert.equal(imported.description,'High quality followers from SMMCPAN');
+    assert.equal(imported.provider_rate_usd,0.9);
+    assert.equal(imported.sell_price_iqd,7500);
+    assert.equal(imported.min_quantity,50);
+    assert.equal(imported.max_quantity,10000);
     assert.equal(db.settings.has(`admin_state_${ADMIN}`),false);
   });
 
