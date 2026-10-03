@@ -325,6 +325,9 @@ async function routeCallback(env, chatId, messageId, userId, user, data, callbac
   if (data === "admin_stats") return await showAdminStats(env, chatId, messageId);
 
   // ===== إجراءات الطلبات (أدمن فقط) =====
+  if (data.startsWith("admin_smm_status_")) return await refreshSmmOrderStatus(env, chatId, messageId, Number(data.slice("admin_smm_status_".length)), messageIsPhoto);
+  if (data.startsWith("admin_smm_reconcile_")) return await showSmmRetryConfirmation(env, chatId, messageId, Number(data.slice("admin_smm_reconcile_".length)), messageIsPhoto);
+  if (data.startsWith("admin_smm_retry_")) return await retrySmmOrderAfterCheck(env, chatId, messageId, Number(data.slice("admin_smm_retry_".length)), messageIsPhoto);
   if (data.startsWith("admin_confirm_") || data.startsWith("admin_cancel_")) {
     if (!await checkAdmin(env, userId)) return;
   }
@@ -795,22 +798,27 @@ async function showMyOrders(env, chatId, messageId, userId) {
   if (!results.length) text += "لا توجد طلبات مسجلة على حسابك بعد.\n";
   for (const order of results) {
     const item = order.package_name || order.service_name || (order.type === "stars" ? "نجوم تيليجرام" : order.type === "premium" ? "تيليجرام بريميوم" : "خدمة اجتماعية");
-    text += "<b>" + (order.order_number || ("#" + order.id)) + "</b> — " + (ORDER_STATUS_AR[order.status] || order.status || "غير معروف") + "\n";
+    const visibleStatus = order.type === "smm" && order.smm_order_id && order.status === "pending" ? ORDER_STATUS_AR.processing : (ORDER_STATUS_AR[order.status] || order.status || "غير معروف");
+    text += "<b>" + (order.order_number || ("#" + order.id)) + "</b> — " + visibleStatus + "\n";
     text += escapeHtml(item) + " — " + Number(order.price_iqd || 0).toLocaleString() + " د.ع\n\n";
+    if (order.type === "smm" && order.smm_order_id) text += "🔄 حالة مزود الخدمة: " + escapeHtml(order.smm_status || "تم الإرسال") + "\n\n";
   }
   await editMessage(env.BOT_TOKEN, chatId, messageId, text, { inline_keyboard: [[{ text: "⬅️ رجوع للحساب", callback_data: "menu_account" }, { text: "🏠 الرئيسية", callback_data: "main_menu" }]] });
 }
 
 async function showAdminOrders(env, chatId, messageId) {
   const { results = [] } = await env.DB.prepare(
-    "SELECT id, order_number, user_id, type, COALESCE(target_link, target_username) AS target, quantity, price_iqd FROM orders WHERE status = 'pending' ORDER BY id DESC LIMIT 10"
+    "SELECT id, order_number, user_id, type, COALESCE(target_link, target_username) AS target, quantity, price_iqd, smm_order_id, smm_status FROM orders WHERE status = 'pending' ORDER BY id DESC LIMIT 10"
   ).all();
   let text = "📦 <b>الطلبات المعلقة</b>\n━━━━━━━━━━━━━━━━━━\n\n";
   const rows = [];
   if (!results.length) text += "لا توجد طلبات معلقة حاليًا.\n";
   for (const order of results) {
     text += "• <code>" + (order.order_number || ("#" + order.id)) + "</code> — " + Number(order.price_iqd || 0).toLocaleString() + " د.ع\n";
-    if (order.type === "smm") text += "  خدمة اجتماعية — كمية " + Number(order.quantity || 0).toLocaleString() + "\n";
+    if (order.type === "smm") {
+      text += "  خدمة اجتماعية — كمية " + Number(order.quantity || 0).toLocaleString() + "\n";
+      if (order.smm_order_id) text += "  SMMCPAN #" + escapeHtml(order.smm_order_id) + " — " + escapeHtml(order.smm_status || "تم الإرسال") + "\n";
+    }
     text += "  الهدف: <code>" + escapeHtml(order.target || "غير محدد") + "</code>\n\n";
     rows.push([{ text: "فتح " + (order.order_number || ("#" + order.id)), callback_data: "admin_order_view_" + order.id }]);
   }
@@ -829,11 +837,13 @@ async function showAdminOrder(env, chatId, messageId, orderId) {
   text += "المستخدم: " + escapeHtml(user?.first_name || "غير معروف") + " (<code>" + order.user_id + "</code>)\n";
   text += "النوع: " + escapeHtml(order.type || "غير معروف") + "\nالهدف: <code>" + escapeHtml(order.target_link || order.target_username || "غير محدد") + "</code>\n";
   if (order.type === "smm") text += "الكمية: " + Number(order.quantity || 0).toLocaleString() + "\n";
+  if (order.type === "smm" && order.smm_order_id) text += "SMMCPAN: <code>" + escapeHtml(order.smm_order_id) + "</code> — " + escapeHtml(order.smm_status || "تم الإرسال") + "\n";
   text += "المبلغ: " + Number(order.price_iqd || 0).toLocaleString() + " د.ع\n\nاختر الإجراء:";
-  await editMessage(env.BOT_TOKEN, chatId, messageId, text, { inline_keyboard: [
-    [{ text: "✅ تأكيد", callback_data: "admin_confirm_" + order.id }, { text: "❌ إلغاء", callback_data: "admin_cancel_" + order.id }],
-    [{ text: "⬅️ كل الطلبات", callback_data: "admin_orders" }]
-  ] });
+  const actions = order.type === "smm" && order.smm_order_id
+    ? [[{ text: "🔄 تحديث حالة المزود", callback_data: "admin_smm_status_" + order.id }], [{ text: "✅ متابعة التنفيذ", callback_data: "admin_confirm_" + order.id }]]
+    : [[{ text: "✅ تأكيد", callback_data: "admin_confirm_" + order.id }, { text: "❌ إلغاء", callback_data: "admin_cancel_" + order.id }]];
+  actions.push([{ text: "⬅️ كل الطلبات", callback_data: "admin_orders" }]);
+  await editMessage(env.BOT_TOKEN, chatId, messageId, text, { inline_keyboard: actions });
 }
 
 async function showAdminGifts(env, chatId, messageId) {
@@ -1371,6 +1381,11 @@ async function handleAdminInput(env, chatId, userId, text, state) {
       await sendMessage(env.BOT_TOKEN, chatId, "⚠️ الطلب غير موجود؛ لم يتم إرسال إشعار إلغاء.");
       return true;
     }
+    if (order.type === "smm" && (order.smm_order_id || ["submitting", "uncertain"].includes(String(order.smm_status || "").toLowerCase()))) {
+      await clearAdminState(env, userId);
+      await sendMessage(env.BOT_TOKEN, chatId, "⚠️ أُرسل الطلب أو نتيجة إرساله غير مؤكدة. لا أستطيع إلغاء سجل البوت وحده؛ تحقّق من الطلب لدى SMMCPAN أولًا.");
+      return true;
+    }
     {
       const cancelled = await env.DB.prepare("UPDATE orders SET status = 'cancelled', cancel_reason = ? WHERE id = ? AND status = 'pending'").bind(reason, orderId).run();
       if (!cancelled?.meta?.changes) {
@@ -1889,9 +1904,143 @@ async function editAdminOrderMessage(env, chatId, messageId, text, keyboard, isP
     : await editMessage(env.BOT_TOKEN, chatId, messageId, text, keyboard);
 }
 
+function isProviderServiceId(value) {
+  const id = String(value ?? "").trim();
+  return /^[0-9]+$/.test(id) && Number.isSafeInteger(Number(id)) && Number(id) > 0;
+}
+
+async function showSmmProviderOrder(env, chatId, messageId, order, isPhoto = false, note = "") {
+  let text = "✅ <b>طلب SMM مرسل تلقائيًا إلى SMMCPAN</b>\n━━━━━━━━━━━━━━━━━━\n\n";
+  text += "📦 طلب المتجر: <code>" + escapeHtml(order.order_number || ("#" + order.id)) + "</code>\n";
+  text += "🆔 رقم طلب المزود: <code>" + escapeHtml(order.smm_order_id || "غير متوفر") + "</code>\n";
+  text += "🔄 حالة المزود: <b>" + escapeHtml(order.smm_status || "تم الاستلام") + "</b>\n";
+  text += "🔗 الرابط: <code>" + escapeHtml(order.target_link || "") + "</code>\n";
+  text += "📊 الكمية: " + Number(order.quantity || 0).toLocaleString() + "\n\n";
+  if (note) text += escapeHtml(note) + "\n\n";
+  text += "حدّث حالة التنفيذ من SMMCPAN؛ عند ظهور Completed سيُغلق الطلب ويُبلّغ المشتري تلقائيًا. يمكنك الإكمال اليدوي فقط بعد التأكد من التنفيذ.";
+  const keyboard = { inline_keyboard: [
+    [{ text: "🔄 تحديث حالة المزود", callback_data: "admin_smm_status_" + order.id }],
+    [{ text: "✅ تأكيد الإكمال اليدوي", callback_data: "admin_confirm_final_" + order.id }],
+    [{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]
+  ] };
+  return await editAdminOrderMessage(env, chatId, messageId, text, keyboard, isPhoto);
+}
+
+async function adminSubmitSmmOrder(env, chatId, messageId, order, service, isPhoto = false) {
+  if (!env.SMMCPAN_KEY) {
+    return await editAdminOrderMessage(env, chatId, messageId, "❌ لم يُرسل الطلب: سر SMMCPAN_KEY غير موجود في Worker. أضفه ثم أعد المحاولة. لم يتم إنشاء طلب لدى المزود.", { inline_keyboard: [[{ text: "🔁 إعادة المحاولة", callback_data: "admin_confirm_" + order.id }], [{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+  }
+  const providerServiceId = String(service?.smmcp_service_id ?? "").trim();
+  const quantity = Number(order.quantity);
+  const link = String(order.target_link || "").trim();
+  let parsedLink;
+  try { parsedLink = new URL(link); } catch { parsedLink = null; }
+  if (!isProviderServiceId(providerServiceId) || !Number.isSafeInteger(quantity) || quantity < 1 || !parsedLink || !["http:", "https:"].includes(parsedLink.protocol)) {
+    return await editAdminOrderMessage(env, chatId, messageId, "❌ لم يُرسل الطلب: رقم خدمة المزود أو الرابط أو الكمية غير صالح. راجع الخدمة والطلب؛ لم يتم إنشاء طلب لدى SMMCPAN.", { inline_keyboard: [[{ text: "⬅️ رجوع", callback_data: "admin_confirm_back_" + order.id }]] }, isPhoto);
+  }
+  const min = Number(service.min_quantity || 1);
+  const max = Number(service.max_quantity || Number.MAX_SAFE_INTEGER);
+  if (quantity < min || quantity > max) {
+    return await editAdminOrderMessage(env, chatId, messageId, "❌ لم يُرسل الطلب: الكمية " + quantity.toLocaleString() + " خارج حدود الخدمة الحالية (" + min.toLocaleString() + "–" + max.toLocaleString() + "). لم يتم إنشاء طلب لدى SMMCPAN.", { inline_keyboard: [[{ text: "⬅️ رجوع", callback_data: "admin_confirm_back_" + order.id }]] }, isPhoto);
+  }
+
+  const claimed = await env.DB.prepare(
+    "UPDATE orders SET smm_status = 'submitting' WHERE id = ? AND status = 'pending' AND (smm_order_id IS NULL OR smm_order_id = '') AND COALESCE(smm_status, '') NOT IN ('submitting', 'uncertain')"
+  ).bind(order.id).run();
+  if (!claimed?.meta?.changes) {
+    const latest = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(order.id).first();
+    if (latest?.smm_order_id) return await showSmmProviderOrder(env, chatId, messageId, latest, isPhoto);
+    const text = latest?.smm_status === "uncertain" || latest?.smm_status === "submitting"
+      ? "⚠️ توجد محاولة إرسال سابقة نتيجتها غير محسومة؛ لم أكرر الطلب لتجنب الخصم أو التنفيذ مرتين. افحص لوحة SMMCPAN أولًا."
+      : "⚠️ لم أتمكن من حجز الطلب للإرسال؛ راجع حالته ثم أعد المحاولة.";
+    const keyboard = { inline_keyboard: [[{ text: "🔎 مراجعة قبل إعادة الإرسال", callback_data: "admin_smm_reconcile_" + order.id }], [{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] };
+    return await editAdminOrderMessage(env, chatId, messageId, text, keyboard, isPhoto);
+  }
+
+  await editAdminOrderMessage(env, chatId, messageId, "⏳ جارٍ إرسال طلب الخدمة إلى SMMCPAN عبر Service ID <code>" + escapeHtml(providerServiceId) + "</code>…", null, isPhoto);
+  const result = await requestSmmProvider(env, { action: "add", service: providerServiceId, link, quantity: String(quantity) });
+  if (!result.ok) {
+    const storedStatus = result.uncertain ? "uncertain" : "error: " + String(result.error || "رفض المزود الطلب").slice(0, 180);
+    await env.DB.prepare("UPDATE orders SET smm_status = ? WHERE id = ? AND status = 'pending' AND smm_status = 'submitting'").bind(storedStatus, order.id).run();
+    if (result.uncertain) {
+      const text = "⚠️ <b>لم يصل تأكيد واضح من SMMCPAN</b>\n\n" + escapeHtml(String(result.error || "نتيجة اتصال غير مؤكدة").slice(0, 250)) + "\n\nلم أعد إرسال الطلب كي لا يتكرر التنفيذ أو الخصم. افحص لوحة SMMCPAN بحثًا عن الخدمة والرابط والكمية؛ إذا لم تجد طلبًا، استخدم زر إعادة المحاولة بعد التحقق.";
+      const keyboard = { inline_keyboard: [[{ text: "🔎 راجعت المزود، إعادة المحاولة", callback_data: "admin_smm_reconcile_" + order.id }], [{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] };
+      return await editAdminOrderMessage(env, chatId, messageId, text, keyboard, isPhoto);
+    }
+    const text = "❌ <b>رفض SMMCPAN إنشاء الطلب</b>\n\n" + escapeHtml(String(result.error || "سبب غير محدد").slice(0, 250)) + "\n\nلم يؤكد المزود إنشاء طلب؛ عالج السبب ثم أعد المحاولة.";
+    return await editAdminOrderMessage(env, chatId, messageId, text, { inline_keyboard: [[{ text: "🔁 إعادة المحاولة", callback_data: "admin_confirm_" + order.id }], [{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+  }
+
+  const providerOrderId = String(result.data?.order ?? "").trim();
+  if (!/^[0-9]+$/.test(providerOrderId) || !Number.isSafeInteger(Number(providerOrderId)) || Number(providerOrderId) <= 0) {
+    await env.DB.prepare("UPDATE orders SET smm_status = 'uncertain' WHERE id = ? AND status = 'pending' AND smm_status = 'submitting'").bind(order.id).run();
+    const text = "⚠️ رد SMMCPAN لا يحتوي رقم طلب صالحًا؛ لم أكرر الإرسال. افحص لوحة المزود قبل اتخاذ إجراء.";
+    return await editAdminOrderMessage(env, chatId, messageId, text, { inline_keyboard: [[{ text: "🔎 مراجعة قبل إعادة الإرسال", callback_data: "admin_smm_reconcile_" + order.id }], [{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+  }
+  const saved = await env.DB.prepare(
+    "UPDATE orders SET smm_order_id = ?, smm_status = 'Submitted' WHERE id = ? AND status = 'pending' AND smm_status = 'submitting' AND (smm_order_id IS NULL OR smm_order_id = '')"
+  ).bind(providerOrderId, order.id).run();
+  if (!saved?.meta?.changes) {
+    console.error("smmOrderAcceptedButNotSaved", { orderId: order.id, providerOrderId });
+    return await editAdminOrderMessage(env, chatId, messageId, "⚠️ قبل SMMCPAN الطلب رقم <code>" + escapeHtml(providerOrderId) + "</code>، لكن تعذّر حفظ الرقم في سجل البوت. لا تعِد الإرسال؛ راجع لوحة المزود وسجل الطلب فورًا.", { inline_keyboard: [[{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+  }
+
+  const updated = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(order.id).first();
+  await sendMessage(env.BOT_TOKEN, order.user_id,
+    "✅ تمت الموافقة على طلبك وإرساله تلقائيًا إلى مزود الخدمة.\n\n📦 طلب المتجر: <code>" + escapeHtml(order.order_number || ("#" + order.id)) + "</code>\n🆔 رقم التنفيذ لدى المزود: <code>" + escapeHtml(providerOrderId) + "</code>\n⏳ الحالة: قيد التنفيذ؛ سنبلغك عند اكتماله.");
+  return await showSmmProviderOrder(env, chatId, messageId, updated || { ...order, smm_order_id: providerOrderId, smm_status: "Submitted" }, isPhoto);
+}
+
+async function showSmmRetryConfirmation(env, chatId, messageId, orderId, isPhoto = false) {
+  const order = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first();
+  if (!order || order.status !== "pending" || order.smm_order_id || !["submitting", "uncertain"].includes(String(order.smm_status || "").toLowerCase())) {
+    return await editAdminOrderMessage(env, chatId, messageId, "⚠️ لا توجد محاولة غير محسومة لإعادة إرسالها. افحص حالة الطلب أولًا.", { inline_keyboard: [[{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+  }
+  const text = "⚠️ <b>تحقق قبل إعادة الإرسال</b>\n\nقد تكون المحاولة السابقة وصلت إلى SMMCPAN رغم انقطاع الرد. ابحث في لوحة المزود عن الخدمة والرابط والكمية. إذا ظهر الطلب، لا تعِد الإرسال. اضغط أدناه فقط إذا تأكدت أن الطلب غير موجود.";
+  return await editAdminOrderMessage(env, chatId, messageId, text, { inline_keyboard: [[{ text: "✅ تأكدت، أعد الإرسال", callback_data: "admin_smm_retry_" + orderId }], [{ text: "⬅️ رجوع", callback_data: "admin_order_view_" + orderId }]] }, isPhoto);
+}
+
+async function retrySmmOrderAfterCheck(env, chatId, messageId, orderId, isPhoto = false) {
+  const reset = await env.DB.prepare(
+    "UPDATE orders SET smm_status = NULL WHERE id = ? AND status = 'pending' AND (smm_order_id IS NULL OR smm_order_id = '') AND smm_status IN ('submitting', 'uncertain')"
+  ).bind(orderId).run();
+  if (!reset?.meta?.changes) return await editAdminOrderMessage(env, chatId, messageId, "⚠️ لم تتغير حالة الطلب؛ لا أعدت إرساله. افتح الطلب وتحقق من حالته.", { inline_keyboard: [[{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+  return await adminConfirmOrder(env, chatId, messageId, orderId, isPhoto);
+}
+
+async function refreshSmmOrderStatus(env, chatId, messageId, orderId, isPhoto = false) {
+  const order = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first();
+  if (!order || order.status !== "pending" || !order.smm_order_id) {
+    return await editAdminOrderMessage(env, chatId, messageId, "⚠️ لا يوجد طلب SMM لدى المزود لفحص حالته.", { inline_keyboard: [[{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+  }
+  const result = await requestSmmProvider(env, { action: "status", order: String(order.smm_order_id) });
+  if (!result.ok) {
+    const text = "❌ تعذر جلب حالة الطلب من SMMCPAN: " + String(result.error || "خطأ غير معروف").slice(0, 200);
+    return await showSmmProviderOrder(env, chatId, messageId, order, isPhoto, text);
+  }
+  const providerStatus = String(result.data?.status || "Unknown").trim().slice(0, 100);
+  await env.DB.prepare("UPDATE orders SET smm_status = ? WHERE id = ? AND status = 'pending' AND smm_order_id = ?").bind(providerStatus, orderId, order.smm_order_id).run();
+  if (providerStatus.toLowerCase() === "completed") return await adminFinalizeOrder(env, chatId, messageId, orderId, isPhoto);
+
+  const updated = { ...order, smm_status: providerStatus };
+  let note = "باقي لدى المزود: " + String(result.data?.remains ?? "غير متاح");
+  if (result.data?.charge !== undefined) note += "\nالكلفة المسجلة لدى المزود: $" + String(result.data.charge);
+  return await showSmmProviderOrder(env, chatId, messageId, updated, isPhoto, note);
+}
+
 async function adminConfirmOrder(env, chatId, messageId, orderId, isPhoto = false) {
   const order = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first();
   if (!order || order.status !== "pending") return await editAdminOrderMessage(env, chatId, messageId, "⚠️ الطلب غير موجود أو حُسم مسبقًا.", { inline_keyboard: [[{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+
+  if (order.type === "smm") {
+    if (order.smm_order_id) return await showSmmProviderOrder(env, chatId, messageId, order, isPhoto);
+    if (["submitting", "uncertain"].includes(String(order.smm_status || "").toLowerCase())) {
+      const text = "⚠️ توجد محاولة إرسال غير محسومة؛ لم أكرر الطلب لتجنب التنفيذ مرتين. افحص لوحة SMMCPAN قبل إعادة المحاولة.";
+      return await editAdminOrderMessage(env, chatId, messageId, text, { inline_keyboard: [[{ text: "🔎 مراجعة قبل إعادة الإرسال", callback_data: "admin_smm_reconcile_" + order.id }], [{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+    }
+    const service = await env.DB.prepare("SELECT * FROM smm_services WHERE id = ?").bind(order.service_id).first();
+    if (isProviderServiceId(service?.smmcp_service_id)) return await adminSubmitSmmOrder(env, chatId, messageId, order, service, isPhoto);
+  }
 
   let text = "⚠️ <b>تأكيد نهائي</b>\n";
   text += "━━━━━━━━━━━━━━━━━━\n\n";
@@ -1934,6 +2083,12 @@ async function adminBackToOrder(env, chatId, messageId, orderId, isPhoto = false
 async function adminFinalizeOrder(env, chatId, messageId, orderId, isPhoto = false) {
   const order = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first();
   if (!order || order.status !== "pending") return await editAdminOrderMessage(env, chatId, messageId, "⚠️ الطلب غير موجود أو حُسم مسبقًا.", { inline_keyboard: [[{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
+  if (order.type === "smm" && !order.smm_order_id) {
+    const service = await env.DB.prepare("SELECT * FROM smm_services WHERE id = ?").bind(order.service_id).first();
+    if (isProviderServiceId(service?.smmcp_service_id)) {
+      return await editAdminOrderMessage(env, chatId, messageId, "⚠️ لم يُرسل هذا الطلب إلى SMMCPAN بعد؛ اضغط تأكيد الطلب لإرساله أولًا.", { inline_keyboard: [[{ text: "✅ إرسال الآن", callback_data: "admin_confirm_" + orderId }], [{ text: "⬅️ رجوع", callback_data: "admin_confirm_back_" + orderId }]] }, isPhoto);
+    }
+  }
 
   const finalized = await env.DB.prepare("UPDATE orders SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'").bind(orderId).run();
   if (!finalized?.meta?.changes) return await editAdminOrderMessage(env, chatId, messageId, "⚠️ سبق حسم هذا الطلب؛ لم يُرسل إشعار مكرر.", null, isPhoto);
@@ -1984,6 +2139,9 @@ async function adminAskCancelReason(env, chatId, messageId, adminId, orderId, is
   if (!order || order.status !== "pending") {
     return await editAdminOrderMessage(env, chatId, messageId, "⚠️ الطلب غير موجود أو حُسم مسبقًا.", { inline_keyboard: [[{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
   }
+  if (order.type === "smm" && (order.smm_order_id || ["submitting", "uncertain"].includes(String(order.smm_status || "").toLowerCase()))) {
+    return await editAdminOrderMessage(env, chatId, messageId, "⚠️ أُرسل الطلب أو نتيجة إرساله غير مؤكدة. لا يمكن إلغاء سجل البوت وحده وترك طلب نشط عند SMMCPAN؛ تحقّق/ألغِه لدى المزود أولًا.", { inline_keyboard: [[{ text: "🔄 فحص حالة SMMCPAN", callback_data: "admin_smm_status_" + orderId }, { text: "⬅️ رجوع", callback_data: "admin_confirm_back_" + orderId }]] }, isPhoto);
+  }
   await setAdminState(env, adminId, { action: "cancel_order", order_id: orderId });
   let text = "❌ <b>إلغاء الطلب</b>\n";
   text += "━━━━━━━━━━━━━━━━━━\n\n";
@@ -2028,6 +2186,31 @@ const SMM_CATEGORY_OPTIONS = [
   { key: "twitter", label: "X" },
   { key: "youtube", label: "يوتيوب" }
 ];
+
+async function requestSmmProvider(env, params) {
+  if (!env.SMMCPAN_KEY) return { ok: false, uncertain: false, error: "مفتاح SMMCPAN_KEY غير مضاف إلى Worker" };
+  try {
+    const body = new URLSearchParams({ key: env.SMMCPAN_KEY, ...params });
+    const response = await fetch(SMM_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+      signal: AbortSignal.timeout(15000)
+    });
+    const raw = await response.text();
+    let data;
+    try { data = JSON.parse(raw); }
+    catch { return { ok: false, uncertain: true, error: "رد غير صالح من المزود (HTTP " + response.status + ")" }; }
+    if (data && typeof data === "object" && data.error) {
+      return { ok: false, uncertain: false, error: String(data.error) };
+    }
+    if (!response.ok) return { ok: false, uncertain: true, error: "تعذر تأكيد الطلب من المزود (HTTP " + response.status + ")" };
+    if (!data || typeof data !== "object") return { ok: false, uncertain: true, error: "رد غير متوقع من المزود" };
+    return { ok: true, data };
+  } catch (error) {
+    return { ok: false, uncertain: true, error: error?.message || "انقطع الاتصال بالمزود" };
+  }
+}
 
 function calculateSmmPrice(rateUsd) {
   const rate = Number(rateUsd);

@@ -70,7 +70,7 @@ class Statement {
       const rows = this.db.orders.filter(x => x.user_id === Number(p[0])).sort((a,b) => b.id-a.id).slice(0, 10).map(x => ({...x, package_name: this.db.packages.find(y => y.id === x.package_id)?.name || null, service_name: null}));
       return { results: rows };
     }
-    if (q.startsWith('select id, order_number, user_id, type, coalesce(target_link, target_username) as target, quantity, price_iqd from orders')) return { results: this.db.orders.filter(x => x.status === 'pending').sort((a,b)=>b.id-a.id).slice(0,10).map(x=>({...x,target:x.target_link||x.target_username})) };
+    if (q.startsWith('select id, order_number, user_id, type, coalesce(target_link, target_username) as target, quantity, price_iqd')) return { results: this.db.orders.filter(x => x.status === 'pending').sort((a,b)=>b.id-a.id).slice(0,10).map(x=>({...x,target:x.target_link||x.target_username})) };
     if (q.includes('from gift_requests g left join users')) return { results: this.db.gifts.filter(x => x.status === 'pending').sort((a,b)=>b.id-a.id).slice(0,10).map(x=>({...x, first_name:this.db.users.find(u=>u.id===x.user_id)?.first_name, username:this.db.users.find(u=>u.id===x.user_id)?.username})) };
     if (q.startsWith('select level, status from gift_requests where user_id =')) return { results: this.db.gifts.filter(x => x.user_id === Number(p[0])).map(x=>({level:x.level,status:x.status})) };
     if (q.startsWith('select * from channels where is_active')) return { results: this.db.channels.filter(x => x.is_active) };
@@ -144,6 +144,32 @@ class Statement {
       if(row){row.total_purchases += Number(p[0]); if(row.total_purchases >= 150){row.has_qualified=1;row.qualified_at ??= 'now';}}
       return this.result(row?1:0);
     }
+    if (q.startsWith("update orders set smm_status = 'submitting'")) {
+      const order=this.db.orders.find(x=>x.id===Number(p[0]));
+      const allowed=order&&order.status==='pending'&&!order.smm_order_id&&!['submitting','uncertain'].includes(String(order.smm_status||'').toLowerCase());
+      if(allowed) order.smm_status='submitting';
+      return this.result(allowed?1:0);
+    }
+    if (q.startsWith('update orders set smm_status = null')) {
+      const order=this.db.orders.find(x=>x.id===Number(p[0]));
+      const allowed=order&&order.status==='pending'&&!order.smm_order_id&&['submitting','uncertain'].includes(String(order.smm_status||'').toLowerCase());
+      if(allowed) order.smm_status=null;
+      return this.result(allowed?1:0);
+    }
+    if (q.startsWith('update orders set smm_order_id = ?')) {
+      const order=this.db.orders.find(x=>x.id===Number(p[1]));
+      const allowed=order&&order.status==='pending'&&order.smm_status==='submitting'&&!order.smm_order_id;
+      if(allowed){order.smm_order_id=String(p[0]);order.smm_status='Submitted';}
+      return this.result(allowed?1:0);
+    }
+    if (q.startsWith('update orders set smm_status = ?')) {
+      const order=this.db.orders.find(x=>x.id===Number(p[1]));
+      const needsProviderId=q.includes('and smm_order_id = ?');
+      const expectedExternalId=needsProviderId?String(p[2]):null;
+      const allowed=order&&order.status==='pending'&&(!q.includes("and smm_status = 'submitting'")||order.smm_status==='submitting')&&(!needsProviderId||String(order.smm_order_id)===expectedExternalId);
+      if(allowed) order.smm_status=p[0];
+      return this.result(allowed?1:0);
+    }
     if (q.startsWith('insert into gift_requests')) {
       const [userId,level,stars,userCheck,levelCheck]=p;
       if(this.db.gifts.some(x=>x.user_id===Number(userCheck)&&x.level===Number(levelCheck)&&['pending','approved'].includes(x.status))) return this.result(0);
@@ -164,15 +190,25 @@ class Statement {
 const db = new MemoryD1();
 const telegramCalls = [];
 const smmServices = [];
+const smmApiCalls = [];
+let smmAddResponse = { order: 9001 };
+let smmStatusResponse = { charge: '0.12', status: 'In progress', remains: '250', start_count: '0', currency: 'USD' };
 const adRequests = [];
 let adResponse = { image:'https://cdn.example.test/ad.jpg', clickUrl:'https://advertiser.example.test/campaign', buttonText:'شاهد العرض', text:'عرض تجريبي' };
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async (url, init={}) => {
   if (String(url) === 'https://smmcpan.com/api/v2') {
     const form = new URLSearchParams(String(init.body));
-    assert.equal(form.get('action'),'services');
     assert.equal(form.get('key'),'test-smm-key');
-    return new Response(JSON.stringify(smmServices), {status:200,headers:{'content-type':'application/json'}});
+    const params=Object.fromEntries(form.entries());
+    smmApiCalls.push(params);
+    if (params.action==='services') return new Response(JSON.stringify(smmServices), {status:200,headers:{'content-type':'application/json'}});
+    if (params.action==='add') {
+      if (smmAddResponse instanceof Error) throw smmAddResponse;
+      return new Response(JSON.stringify(smmAddResponse), {status:200,headers:{'content-type':'application/json'}});
+    }
+    if (params.action==='status') return new Response(JSON.stringify(smmStatusResponse), {status:200,headers:{'content-type':'application/json'}});
+    return new Response(JSON.stringify({error:'unsupported test action'}), {status:400,headers:{'content-type':'application/json'}});
   }
   if (String(url) === 'https://bid.tgads.live/bid-request') {
     adRequests.push(JSON.parse(String(init.body)));
@@ -364,6 +400,7 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
   });
 
   await t.test('SMM order collects a valid target link and bounded quantity before payment', async () => {
+    const addCallsBefore=smmApiCalls.filter(x=>x.action==='add').length;
     await click(USER,'order_svc_5');
     assert.equal(db.settings.get(`user_state_${USER}`).step,'target_link');
     await message(USER,'instagram.com/example');
@@ -384,6 +421,70 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     assert.equal(order.status,'pending');
     assert.ok(telegramCalls.some(x=>x.method==='sendMessage'&&x.body.chat_id===ADMIN&&String(x.body.text).includes('رابط التنفيذ')));
     assert.equal(db.settings.has(`user_state_${USER}`),false);
+    assert.equal(smmApiCalls.filter(x=>x.action==='add').length,addCallsBefore,'the provider is not charged before admin approval');
+  });
+
+  await t.test('admin approval creates one SMMCPAN order by provider Service ID and status completion notifies the buyer', async () => {
+    const service={id:6,smmcp_service_id:'94821',category:'إنستغرام',name:'Instagram followers',description:'',sell_price_iqd:5000,provider_rate_usd:0.12,min_quantity:100,max_quantity:1000,is_active:1};
+    const order={id:10,order_number:'AP-TEST-SMM-10',user_id:USER,type:'smm',package_id:null,service_id:service.id,target_username:null,target_link:'https://instagram.com/example',quantity:250,stars_amount:0,bonus_amount:0,price_iqd:1250,status:'pending',smm_order_id:null,smm_status:null};
+    db.services.push(service);
+    db.orders.push(order);
+    smmAddResponse={order:880010};
+    const before=smmApiCalls.filter(x=>x.action==='add').length;
+    await click(ADMIN,'admin_confirm_10');
+    const addCall=smmApiCalls.filter(x=>x.action==='add').at(-1);
+    assert.equal(smmApiCalls.filter(x=>x.action==='add').length,before+1);
+    assert.deepEqual({service:addCall.service,link:addCall.link,quantity:addCall.quantity},{service:'94821',link:order.target_link,quantity:'250'});
+    assert.equal(order.smm_order_id,'880010');
+    assert.equal(order.smm_status,'Submitted');
+    assert.equal(order.status,'pending','the shop order remains open while the provider processes it');
+    assert.ok(telegramCalls.some(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تلقائيًا إلى مزود الخدمة')));
+
+    await click(ADMIN,'admin_confirm_10');
+    assert.equal(smmApiCalls.filter(x=>x.action==='add').length,before+1,'repeated admin callbacks must not create a duplicate provider order');
+    smmStatusResponse={charge:'0.12',status:'In progress',remains:'200',start_count:'50',currency:'USD'};
+    await click(ADMIN,'admin_smm_status_10');
+    assert.equal(smmApiCalls.at(-1).action,'status');
+    assert.equal(smmApiCalls.at(-1).order,'880010');
+    assert.equal(order.smm_status,'In progress');
+    assert.equal(order.status,'pending');
+
+    smmStatusResponse={charge:'0.12',status:'Completed',remains:'0',start_count:'250',currency:'USD'};
+    const noticesBefore=telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تم تنفيذ طلبك بنجاح')).length;
+    await click(ADMIN,'admin_smm_status_10');
+    assert.equal(order.status,'completed');
+    assert.equal(order.smm_status,'Completed');
+    assert.equal(telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تم تنفيذ طلبك بنجاح')).length,noticesBefore+1);
+    smmStatusResponse={charge:'0.12',status:'In progress',remains:'250',start_count:'0',currency:'USD'};
+  });
+
+  await t.test('uncertain SMM submission cannot be repeated until the admin checks the provider', async () => {
+    const service={id:7,smmcp_service_id:'94822',category:'إنستغرام',name:'Instagram likes',description:'',sell_price_iqd:4000,provider_rate_usd:0.1,min_quantity:100,max_quantity:1000,is_active:1};
+    const order={id:11,order_number:'AP-TEST-SMM-11',user_id:USER,type:'smm',service_id:service.id,target_link:'https://instagram.com/other',quantity:300,price_iqd:1200,status:'pending',smm_order_id:null,smm_status:null};
+    db.services.push(service);
+    db.orders.push(order);
+    smmAddResponse=new Error('synthetic timeout');
+    const before=smmApiCalls.filter(x=>x.action==='add').length;
+    await click(ADMIN,'admin_confirm_11');
+    assert.equal(order.smm_status,'uncertain');
+    assert.equal(smmApiCalls.filter(x=>x.action==='add').length,before+1);
+    await click(ADMIN,'admin_confirm_11');
+    assert.equal(smmApiCalls.filter(x=>x.action==='add').length,before+1,'uncertain submissions must not auto-retry');
+    await click(ADMIN,'admin_smm_reconcile_11');
+    smmAddResponse={order:880011};
+    await click(ADMIN,'admin_smm_retry_11');
+    assert.equal(order.smm_order_id,'880011');
+    assert.equal(smmApiCalls.filter(x=>x.action==='add').length,before+2,'a retry occurs only after the explicit provider-check flow');
+  });
+
+  await t.test('provider-backed SMM service cannot be marked complete before the provider accepts it', async () => {
+    const service={id:8,smmcp_service_id:'94823',category:'إنستغرام',name:'Instagram views',description:'',sell_price_iqd:3000,provider_rate_usd:0.08,min_quantity:100,max_quantity:1000,is_active:1};
+    const order={id:12,order_number:'AP-TEST-SMM-12',user_id:USER,type:'smm',service_id:service.id,target_link:'https://instagram.com/third',quantity:200,price_iqd:600,status:'pending',smm_order_id:null,smm_status:null};
+    db.services.push(service);
+    db.orders.push(order);
+    await click(ADMIN,'admin_confirm_final_12');
+    assert.equal(order.status,'pending');
+    assert.equal(order.smm_order_id,null);
   });
 
   await t.test('admin cancellation resolves once and escapes the reason sent to the customer', async () => {
