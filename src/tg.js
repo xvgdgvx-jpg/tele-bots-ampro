@@ -29,6 +29,13 @@ export async function editMessage(token, chatId, messageId, text, keyboard = nul
   return await apiCall(token, "editMessageText", body);
 }
 
+// تعديل caption في الرسائل التي تحتوي صورة/مرفقًا؛ Telegram لا يقبل editMessageText لها.
+export async function editMessageCaption(token, chatId, messageId, text, keyboard = null, parseMode = "HTML") {
+  const body = { chat_id: chatId, message_id: messageId, caption: text, parse_mode: parseMode };
+  if (keyboard) body.reply_markup = keyboard;
+  return await apiCall(token, "editMessageCaption", body);
+}
+
 // تعديل أزرار رسالة موجودة فقط
 export async function editMessageReplyMarkup(token, chatId, messageId, keyboard = null) {
   const body = {
