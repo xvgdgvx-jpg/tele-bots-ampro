@@ -28,6 +28,8 @@ export default {
     return new Response("OK", { status: 200 });
   },
   async scheduled(controller, env) {
+    await processPendingBroadcast(env);
+    await processPendingSmmCustomerNotices(env);
     await pollPendingSmmOrders(env);
   }
 };
@@ -224,7 +226,7 @@ async function handleCallback(query, env) {
 
 async function routeCallback(env, chatId, messageId, userId, user, data, callbackId, messageIsPhoto = false) {
   // Navigation cancels stale forms. Category selection keeps its active import state.
-  if (!data.startsWith("svc_cat_") && !data.startsWith("admin_smm_import_cat_")) await clearAdminState(env, userId);
+  if (!data.startsWith("svc_cat_") && !data.startsWith("admin_smm_import_cat_") && !data.startsWith("admin_broadcast_")) await clearAdminState(env, userId);
   if (!data.startsWith("order_") && !data.startsWith("reorder_") && !data.startsWith("svc_cat_")) await clearUserState(env, userId);
 
   // ===== قنوات =====
@@ -322,6 +324,9 @@ async function routeCallback(env, chatId, messageId, userId, user, data, callbac
   }
 
   // ===== لوحة الأدمن =====
+  if (data === "admin_broadcast") return await startBroadcast(env, chatId, messageId, userId);
+  if (data === "admin_broadcast_confirm") return await confirmBroadcast(env, chatId, messageId, userId);
+  if (data === "admin_broadcast_cancel") return await cancelBroadcast(env, chatId, messageId, userId);
   if (data === "admin_back") return await editAdminPanel(env, chatId, messageId);
   if (data === "admin_order_view_" || data.startsWith("admin_order_view_")) {
     const orderId = parseInt(data.slice("admin_order_view_".length), 10);
@@ -749,6 +754,34 @@ async function showPremiumMenu(env, chatId, messageId) {
   await editMessage(env.BOT_TOKEN, chatId, messageId, text, kb);
 }
 
+function smmPlatformInfo(category) {
+  const value = String(category || "").toLowerCase();
+  if (value.includes("instagram") || value.includes("إنست") || value.includes("انست")) return { label: "إنستغرام", profile: "https://www.instagram.com/username/", content: "https://www.instagram.com/p/POST_ID/ أو رابط Reel" };
+  if (value.includes("tiktok") || value.includes("تيك")) return { label: "تيك توك", profile: "https://www.tiktok.com/@username", content: "https://www.tiktok.com/@username/video/VIDEO_ID" };
+  if (value.includes("youtube") || value.includes("يوتيوب")) return { label: "يوتيوب", profile: "https://www.youtube.com/@ChannelName", content: "https://www.youtube.com/watch?v=VIDEO_ID" };
+  if (value.includes("facebook") || value.includes("فيس")) return { label: "فيسبوك", profile: "https://www.facebook.com/PageName", content: "https://www.facebook.com/PageName/posts/POST_ID أو https://www.facebook.com/reel/REEL_ID" };
+  if (value.includes("snap") || value.includes("سناب")) return { label: "سناب شات", profile: "https://www.snapchat.com/add/username", content: "https://www.snapchat.com/spotlight/VIDEO_ID" };
+  if (value === "x" || value.includes("twitter") || value.includes("تويتر")) return { label: "X", profile: "https://x.com/username", content: "https://x.com/username/status/POST_ID" };
+  if (value.includes("telegram") || value.includes("تيلي")) return { label: "تيليجرام", profile: "https://t.me/channelusername", content: "https://t.me/channelusername/123" };
+  return { label: String(category || "الخدمة"), profile: "رابط الحساب أو القناة العامة", content: "رابط المنشور أو المقطع المطلوب" };
+}
+
+function getSmmLinkPrompt(service) {
+  const platform = smmPlatformInfo(service?.category);
+  const serviceLabel = String(service?.name || "");
+  const details = (serviceLabel + " " + String(service?.description || "")).replace(/[_-]+/g, " ");
+  const isPostService = /(views?|likes?|comments?|reactions?|shares?|مشاهدات|إعجابات|لايكات|تعليقات|مشاركات|مشاهدة)/i.test(details)
+    && !/(followers?|subscribers?|members?|profile|account|channel|page\s+(?:likes|followers)|likes\s+page|متابعين|متابع|مشتركين|أعضاء|إعجابات الصفحة|حساب|قناة|صفحة)/i.test(details);
+  const example = isPostService ? platform.content : platform.profile;
+  const target = isPostService ? "المنشور أو المقطع" : "الحساب أو القناة";
+  return "🔗 <b>رابط " + escapeHtml(target) + " لخدمة " + escapeHtml(serviceLabel || platform.label) + "</b>\nأرسل الرابط العام الكامل " + (isPostService ? "للمنشور أو المقطع" : "للحساب أو القناة") + ".\nمثال: <code>" + escapeHtml(example) + "</code>\nلا ترسل اسم المستخدم وحده، وتأكد أن الرابط يطابق نوع الخدمة.";
+}
+
+function getSmmCategoryGuide(category) {
+  const platform = smmPlatformInfo(category);
+  return "اختر الخدمة المناسبة لـ" + platform.label + ". ستظهر لك صيغة الرابط المطلوبة قبل إدخال الطلب؛ مثال الحساب: <code>" + escapeHtml(platform.profile) + "</code>، ومثال المنشور/المقطع: <code>" + escapeHtml(platform.content) + "</code>.";
+}
+
 async function showSmmCategory(env, chatId, messageId, category) {
   const names = {
     telegram: "تيليجرام", instagram: "إنستغرام", tiktok: "تيك توك",
@@ -762,11 +795,8 @@ async function showSmmCategory(env, chatId, messageId, category) {
 
   let text = "📣 <b>خدمات " + catName + "</b>\n";
   text += "━━━━━━━━━━━━━━━━━━\n\n";
-  text += "✅ جودة عالية\n";
-  text += "⚡ تنفيذ سريع\n";
-  text += "🛡 ضمان كامل\n\n";
-  text += "━━━━━━━━━━━━━━━━━━\n";
-  text += "👇 <b>اضغط على الخدمة لعرض الشرح الكامل والسعر قبل الطلب:</b>";
+  text += getSmmCategoryGuide(catName) + "\n\n";
+  text += "👇 <b>اختر الخدمة لعرض تفاصيلها وسعرها وحدود الكمية قبل الطلب:</b>";
 
   const rows = [];
   if (results && results.length > 0) {
@@ -802,10 +832,85 @@ function adminPanelKb() {
       [{ text: "📦 الطلبات", callback_data: "admin_orders" }, { text: "🎁 الهدايا", callback_data: "admin_gifts" }],
       [{ text: "📊 الإحصائيات", callback_data: "admin_stats" }, { text: "⭐ الباقات", callback_data: "admin_packages" }],
       [{ text: "🛍 الخدمات", callback_data: "admin_services" }, { text: "🔄 مزامنة SMM", callback_data: "admin_smm_sync" }],
+      [{ text: "📣 رسالة جماعية", callback_data: "admin_broadcast" }],
       [{ text: "📢 القنوات", callback_data: "admin_channels" }, { text: "👤 الأدمنز", callback_data: "admin_admins" }],
       [{ text: "❌ إغلاق", callback_data: "admin_close" }]
     ]
   };
+}
+
+const BROADCAST_JOB_KEY = "admin_broadcast_job";
+const BROADCAST_BATCH_SIZE = 100;
+
+async function startBroadcast(env, chatId, messageId, adminId) {
+  if (!await checkAdmin(env, adminId)) return;
+  await setAdminState(env, adminId, { action: "admin_broadcast", step: "message", data: {} });
+  await editMessage(env.BOT_TOKEN, chatId, messageId,
+    "📣 <b>رسالة جماعية</b>\n\nأرسل نص الرسالة التي تريد إرسالها إلى أعضاء البوت النشطين. ستظهر لك معاينة ويجب تأكيدها قبل بدء الإرسال.\n\nللإلغاء أرسل /cancel.",
+    { inline_keyboard: [[{ text: "❌ إلغاء", callback_data: "admin_broadcast_cancel" }]] });
+}
+
+async function getBroadcastRecipientCount(env) {
+  const row = await env.DB.prepare("SELECT COUNT(*) AS c FROM users WHERE COALESCE(is_blocked, 0) = 0").first();
+  return Number(row?.c || 0);
+}
+
+async function confirmBroadcast(env, chatId, messageId, adminId) {
+  if (!await checkAdmin(env, adminId)) return;
+  const state = await getAdminState(env, adminId);
+  const message = String(state?.data?.message || "").trim();
+  if (!state || state.action !== "admin_broadcast" || state.step !== "confirm" || !message) {
+    await clearAdminState(env, adminId);
+    return await editMessage(env.BOT_TOKEN, chatId, messageId, "⚠️ انتهت معاينة الرسالة. ابدأ من زر الرسالة الجماعية مرة أخرى.", { inline_keyboard: [[{ text: "⬅️ لوحة الأدمن", callback_data: "admin_back" }]] });
+  }
+  const job = { status: "running", message, last_user_id: 0, sent: 0, failed: 0, started_by: Number(adminId), created_at: Date.now() };
+  const inserted = await env.DB.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)").bind(BROADCAST_JOB_KEY, JSON.stringify(job)).run();
+  await clearAdminState(env, adminId);
+  if (!inserted?.meta?.changes) {
+    return await editMessage(env.BOT_TOKEN, chatId, messageId, "⏳ توجد رسالة جماعية قيد الإرسال بالفعل. انتظر اكتمالها ثم ابدأ رسالة أخرى.", { inline_keyboard: [[{ text: "⬅️ لوحة الأدمن", callback_data: "admin_back" }]] });
+  }
+  const recipients = await getBroadcastRecipientCount(env);
+  return await editMessage(env.BOT_TOKEN, chatId, messageId,
+    "✅ <b>بدأ إرسال الرسالة الجماعية</b>\n\nسيعالج البوت الأعضاء على دفعات لتجنب تجاوز حدود تيليجرام.\n👥 المستلمون النشطون حاليًا: " + recipients.toLocaleString() + "\n📊 ستصلك خلاصة بعد انتهاء الإرسال.",
+    { inline_keyboard: [[{ text: "⬅️ لوحة الأدمن", callback_data: "admin_back" }]] });
+}
+
+async function cancelBroadcast(env, chatId, messageId, adminId) {
+  if (!await checkAdmin(env, adminId)) return;
+  await clearAdminState(env, adminId);
+  return await editMessage(env.BOT_TOKEN, chatId, messageId, "✅ تم إلغاء إعداد الرسالة الجماعية؛ لم يبدأ أي إرسال.", { inline_keyboard: [[{ text: "⬅️ لوحة الأدمن", callback_data: "admin_back" }]] });
+}
+
+async function finishBroadcast(env, job) {
+  await env.DB.prepare("DELETE FROM settings WHERE key = ?").bind(BROADCAST_JOB_KEY).run();
+  await sendMessage(env.BOT_TOKEN, job.started_by,
+    "✅ <b>اكتمل إرسال الرسالة الجماعية</b>\n📨 أُرسلت: " + Number(job.sent || 0).toLocaleString() + "\n⚠️ تعذر الإرسال: " + Number(job.failed || 0).toLocaleString());
+}
+
+async function processPendingBroadcast(env) {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(BROADCAST_JOB_KEY).first();
+  let job;
+  try { job = row ? JSON.parse(row.value) : null; } catch { job = null; }
+  if (!job || job.status !== "running") return;
+
+  const { results = [] } = await env.DB.prepare(
+    "SELECT id FROM users WHERE id > ? AND COALESCE(is_blocked, 0) = 0 ORDER BY id ASC LIMIT ?"
+  ).bind(Number(job.last_user_id || 0), BROADCAST_BATCH_SIZE).all();
+  if (!results.length) return await finishBroadcast(env, job);
+
+  const text = escapeHtml(String(job.message || ""));
+  for (let i = 0; i < results.length; i += 20) {
+    const batch = results.slice(i, i + 20);
+    const outcomes = await Promise.all(batch.map(user => sendMessage(env.BOT_TOKEN, user.id, text)));
+    for (const outcome of outcomes) {
+      if (outcome?.ok) job.sent = Number(job.sent || 0) + 1;
+      else job.failed = Number(job.failed || 0) + 1;
+    }
+    if (i + 20 < results.length) await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  job.last_user_id = Number(results[results.length - 1].id);
+  if (results.length < BROADCAST_BATCH_SIZE) return await finishBroadcast(env, job);
+  await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(BROADCAST_JOB_KEY, JSON.stringify(job)).run();
 }
 
 async function showAdminStats(env, chatId, messageId) {
@@ -833,6 +938,14 @@ const GIFT_MILESTONES = [
 ];
 const ORDER_STATUS_AR = { pending: "قيد المراجعة", processing: "قيد التنفيذ", completed: "مكتمل", cancelled: "ملغى" };
 
+function customerSmmStatus(order) {
+  if (order.status === "completed") return "مكتمل";
+  if (order.status === "cancelled") return "ملغى";
+  const status = String(order.smm_status || "").trim().toLowerCase();
+  if (status === "in progress" || status === "processing" || status === "running") return "قيد التنفيذ";
+  return "بانتظار التنفيذ";
+}
+
 async function showMyOrders(env, chatId, messageId, userId) {
   const { results = [] } = await env.DB.prepare(
     "SELECT o.*, p.name AS package_name, s.name AS service_name FROM orders o LEFT JOIN packages p ON p.id = o.package_id LEFT JOIN smm_services s ON s.id = o.service_id WHERE o.user_id = ? ORDER BY o.id DESC LIMIT 10"
@@ -841,10 +954,9 @@ async function showMyOrders(env, chatId, messageId, userId) {
   if (!results.length) text += "لا توجد طلبات مسجلة على حسابك بعد.\n";
   for (const order of results) {
     const item = order.package_name || order.service_name || (order.type === "stars" ? "نجوم تيليجرام" : order.type === "premium" ? "تيليجرام بريميوم" : "خدمة اجتماعية");
-    const visibleStatus = order.type === "smm" && order.smm_order_id && order.status === "pending" ? ORDER_STATUS_AR.processing : (ORDER_STATUS_AR[order.status] || order.status || "غير معروف");
+    const visibleStatus = order.type === "smm" ? customerSmmStatus(order) : (ORDER_STATUS_AR[order.status] || order.status || "غير معروف");
     text += "<b>" + (order.order_number || ("#" + order.id)) + "</b> — " + visibleStatus + "\n";
     text += escapeHtml(item) + " — " + Number(order.price_iqd || 0).toLocaleString() + " د.ع\n\n";
-    if (order.type === "smm" && order.smm_order_id) text += "🔄 حالة مزود الخدمة: " + escapeHtml(order.smm_status || "تم الإرسال") + "\n\n";
   }
   await editMessage(env.BOT_TOKEN, chatId, messageId, text, { inline_keyboard: [[{ text: "⬅️ رجوع للحساب", callback_data: "menu_account" }, { text: "🏠 الرئيسية", callback_data: "main_menu" }]] });
 }
@@ -1329,6 +1441,35 @@ async function cancelAdminRemoval(env, chatId, messageId, actorId) {
 async function handleAdminInput(env, chatId, userId, text, state) {
   const data = state.data || {};
 
+  if (state.action === "admin_broadcast" && state.step === "message") {
+    const message = String(text || "").trim();
+    if (message === "/cancel") {
+      await clearAdminState(env, userId);
+      await sendMessage(env.BOT_TOKEN, chatId, "✅ تم إلغاء إعداد الرسالة الجماعية؛ لم يبدأ أي إرسال.");
+      return true;
+    }
+    if (!message || message.startsWith("/")) {
+      await sendMessage(env.BOT_TOKEN, chatId, "❌ أرسل نص الرسالة، أو /cancel للإلغاء.");
+      return true;
+    }
+    if (message.length > 3500) {
+      await sendMessage(env.BOT_TOKEN, chatId, "❌ الرسالة أطول من 3500 حرف. اختصرها ثم أعد الإرسال.");
+      return true;
+    }
+    data.message = message;
+    state.data = data;
+    state.step = "confirm";
+    await setAdminState(env, userId, state);
+    const recipients = await getBroadcastRecipientCount(env);
+    await sendMessage(env.BOT_TOKEN, chatId,
+      "👀 <b>معاينة الرسالة الجماعية</b>\n━━━━━━━━━━━━━━━━━━\n\n" + escapeHtml(message) + "\n\n━━━━━━━━━━━━━━━━━━\n👥 ستُرسل إلى نحو " + recipients.toLocaleString() + " مستخدم نشط. هل تؤكد بدء الإرسال؟",
+      { inline_keyboard: [
+        [{ text: "✅ تأكيد الإرسال", callback_data: "admin_broadcast_confirm" }],
+        [{ text: "❌ إلغاء", callback_data: "admin_broadcast_cancel" }]
+      ] });
+    return true;
+  }
+
   // ===== تعديل شرح خدمة SMM =====
   if (state.action === "edit_smm_description" && state.step === "description") {
       const description = text.trim();
@@ -1374,14 +1515,33 @@ async function handleAdminInput(env, chatId, userId, text, state) {
       await sendMessage(env.BOT_TOKEN, chatId, "❌ أدخل سعر بيع صحيحًا بالدينار العراقي (عدد صحيح أكبر من صفر).");
       return true;
     }
+    data.sell_price_iqd = price;
+    state.step = "min_quantity";
+    state.data = data;
+    await setAdminState(env, userId, state);
+    const service = data.provider_service;
+    const providerMin = Number(service.provider_min_quantity || 1);
+    await sendMessage(env.BOT_TOKEN, chatId,
+      "💵 تم حفظ سعر البيع: " + price.toLocaleString() + " د.ع لكل 1000.\n\nأرسل <b>الحد الأدنى الذي تختاره لهذه الخدمة</b> (لا يقل عن حد الموقع " + providerMin.toLocaleString() + " ولا يزيد على الحد الأعلى " + Number(service.max_quantity).toLocaleString() + ").");
+    return true;
+  }
+
+  if (state.action === "add_smm_service" && state.step === "min_quantity") {
+    const minQuantity = parseSmmIqd(text);
+    const service = data.provider_service;
+    const providerMin = Number(service?.provider_min_quantity || 1);
+    const maxQuantity = Number(service?.max_quantity);
+    if (!Number.isSafeInteger(minQuantity) || minQuantity < providerMin || minQuantity > maxQuantity) {
+      await sendMessage(env.BOT_TOKEN, chatId, "❌ أدخل حدًا أدنى صحيحًا بين " + providerMin.toLocaleString() + " و" + maxQuantity.toLocaleString() + ".");
+      return true;
+    }
     try {
-      const service = data.provider_service;
       await env.DB.prepare(
         "INSERT INTO smm_services (smmcp_service_id, category, name, description, provider_rate_usd, sell_price_iqd, min_quantity, max_quantity, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)"
-      ).bind(service.service_id, data.category, service.name, service.description, service.provider_rate_usd, price, service.min_quantity, service.max_quantity).run();
+      ).bind(service.service_id, data.category, service.name, service.description, service.provider_rate_usd, data.sell_price_iqd, minQuantity, service.max_quantity).run();
       await clearAdminState(env, userId);
       await sendMessage(env.BOT_TOKEN, chatId,
-        "✅ <b>تم استيراد الخدمة</b>\n\n📌 " + escapeHtml(service.name) + "\n🆔 Service ID: <code>" + escapeHtml(service.service_id) + "</code>\n📁 الفئة: " + escapeHtml(data.category) + "\n💲 تكلفة المزود: $" + Number(service.provider_rate_usd).toFixed(4) + " لكل 1000\n💵 سعر البيع: " + price.toLocaleString() + " د.ع لكل 1000\n📊 الحدود: " + service.min_quantity.toLocaleString() + "–" + service.max_quantity.toLocaleString() + "\n\n👁 الخدمة مفعّلة للمستخدمين.",
+        "✅ <b>تم استيراد الخدمة</b>\n\n📌 " + escapeHtml(service.name) + "\n🆔 Service ID: <code>" + escapeHtml(service.service_id) + "</code>\n📁 الفئة: " + escapeHtml(data.category) + "\n💲 تكلفة المزود: $" + Number(service.provider_rate_usd).toFixed(4) + " لكل 1000\n💵 سعر البيع: " + data.sell_price_iqd.toLocaleString() + " د.ع لكل 1000\n📊 الحد الأدنى الذي حددته: " + minQuantity.toLocaleString() + "\n📊 الحد الأعلى من الموقع: " + Number(service.max_quantity).toLocaleString() + "\n\n👁 الخدمة مفعّلة للمستخدمين.",
         { inline_keyboard: [[{ text: "🛍 إدارة الخدمات", callback_data: "admin_services" }]] });
     } catch (e) {
       console.error("importSmmService:", e);
@@ -1745,11 +1905,8 @@ async function showServiceDetails(env, chatId, messageId, svcId) {
   text += "💵 <b>السعر لكل 1000:</b> " + Number(svc.sell_price_iqd).toLocaleString() + " د.ع\n";
   text += "📊 <b>الحد الأدنى:</b> " + Number(svc.min_quantity).toLocaleString() + "\n";
   text += "📊 <b>الحد الأقصى:</b> " + Number(svc.max_quantity).toLocaleString() + "\n\n";
-  text += "━━━━━━━━━━━━━━━━━━\n";
-  text += "✅ جودة عالية\n";
-  text += "⚡ تنفيذ سريع\n";
-  text += "💬 دعم مباشر\n\n";
-  text += "👇 اضغط للطلب:";
+  text += "تأكد أن الرابط عام ويخص الخدمة المطلوبة، وأن الكمية ضمن الحدود أعلاه.\n\n";
+  text += "👇 اضغط لبدء الطلب:";
 
   const kb = {
     inline_keyboard: [
@@ -1772,7 +1929,7 @@ async function startOrder(env, chatId, messageId, userId, orderType, itemId) {
       return await editMessage(env.BOT_TOKEN, chatId, messageId, "⚠️ هذه الخدمة غير متاحة حاليًا.", { inline_keyboard: [[{ text: "🏠 الرئيسية", callback_data: "main_menu" }]] });
     }
     step = "target_link";
-    text = "🔗 <b>رابط الخدمة</b>\n━━━━━━━━━━━━━━━━━━\n\nأرسل الرابط الذي تريد تنفيذ الخدمة عليه.\nالكمية المسموحة: " + service.min_quantity.toLocaleString() + "–" + service.max_quantity.toLocaleString() + ".";
+    text = "🔗 <b>الرابط المطلوب</b>\n━━━━━━━━━━━━━━━━━━\n\n" + getSmmLinkPrompt(service);
   } else {
     const pkg = await env.DB.prepare("SELECT * FROM packages WHERE id = ?").bind(itemId).first();
     if (!pkg || pkg.is_active !== 1) {
@@ -2118,7 +2275,7 @@ async function adminSubmitSmmOrder(env, chatId, messageId, order, service, isPho
 
   const updated = await env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(order.id).first();
   await sendMessage(env.BOT_TOKEN, order.user_id,
-    "✅ تمت الموافقة على طلبك وبدأ تنفيذ الخدمة.\n\n📦 طلب المتجر: <code>" + escapeHtml(order.order_number || ("#" + order.id)) + "</code>\n⏳ قد يستغرق إكمال طلبك من دقيقة إلى ساعة حسب ضغط الطلبات في الطابور، وسنبلغك فور اكتماله.");
+    "✅ تمت الموافقة على طلبك.\n\n📦 طلب المتجر: <code>" + escapeHtml(order.order_number || ("#" + order.id)) + "</code>\n⏳ يبدأ التنفيذ حسب ترتيب الطلبات؛ وقد يستغرق من دقيقة إلى ساعة حسب ضغط الطابور. سنبلغك عند بدء التنفيذ الفعلي وعند اكتماله.");
   return await showSmmProviderOrder(env, chatId, messageId, updated || { ...order, smm_order_id: providerOrderId, smm_status: "Submitted" }, isPhoto);
 }
 
@@ -2155,15 +2312,80 @@ function isTerminalSmmProviderStatus(status) {
   return ["canceled", "cancelled", "partial", "refunded", "failed"].includes(String(status || "").trim().toLowerCase());
 }
 
+function isSmmInProgressStatus(status) {
+  return ["in progress", "processing", "running"].includes(String(status || "").trim().toLowerCase());
+}
+
+async function queueSmmCustomerNotice(env, order, noticeType, text) {
+  const key = "smm_customer_notice:" + order.id + ":" + noticeType;
+  const payload = { status: "pending", chat_id: Number(order.user_id), text, attempts: 0 };
+  await env.DB.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)").bind(key, JSON.stringify(payload)).run();
+  await deliverSmmCustomerNotice(env, key);
+}
+
+async function deliverSmmCustomerNotice(env, key, knownRow = null) {
+  const row = knownRow || await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first();
+  if (!row?.value) return false;
+  let notice;
+  try { notice = JSON.parse(row.value); } catch { return false; }
+  if (notice.status === "sent") return true;
+  if (notice.status === "sending" && Date.now() - Number(notice.claimed_at || 0) < 5 * 60 * 1000) return false;
+
+  const claim = { ...notice, status: "sending", claimed_at: Date.now() };
+  const claimValue = JSON.stringify(claim);
+  const claimed = await env.DB.prepare("UPDATE settings SET value = ? WHERE key = ? AND value = ?").bind(claimValue, key, row.value).run();
+  if (!claimed?.meta?.changes) return false;
+
+  let result;
+  try { result = await sendMessage(env.BOT_TOKEN, notice.chat_id, notice.text); }
+  catch (error) { console.error("smmCustomerNoticeFailed", { key, error: error?.message || String(error) }); }
+  if (result?.ok) {
+    await env.DB.prepare("UPDATE settings SET value = ? WHERE key = ? AND value = ?").bind(JSON.stringify({ ...notice, status: "sent", sent_at: Date.now() }), key, claimValue).run();
+    return true;
+  }
+  await env.DB.prepare("UPDATE settings SET value = ? WHERE key = ? AND value = ?").bind(JSON.stringify({ ...notice, status: "pending", attempts: Number(notice.attempts || 0) + 1 }), key, claimValue).run();
+  return false;
+}
+
+async function processPendingSmmCustomerNotices(env) {
+  const { results = [] } = await env.DB.prepare(
+    "SELECT key, value FROM settings WHERE key LIKE 'smm_customer_notice:%' AND (value LIKE '%\"status\":\"pending\"%' OR value LIKE '%\"status\":\"sending\"%') ORDER BY key LIMIT 20"
+  ).all();
+  for (const row of results) await deliverSmmCustomerNotice(env, row.key, row);
+}
+
 async function completeSmmProviderOrder(env, order) {
   const finalized = await env.DB.prepare(
     "UPDATE orders SET status = 'completed', completed_at = CURRENT_TIMESTAMP, smm_status = 'Completed' WHERE id = ? AND status = 'pending' AND smm_order_id = ?"
   ).bind(order.id, String(order.smm_order_id)).run();
   if (!finalized?.meta?.changes) return false;
   const orderNumber = escapeHtml(order.order_number || ("#" + order.id));
-  await sendMessage(env.BOT_TOKEN, order.user_id,
+  await queueSmmCustomerNotice(env, order, "completed",
     "✅ <b>تم اكتمال طلبك بنجاح</b>\n\n📦 طلب المتجر: <code>" + orderNumber + "</code>\nشكراً لثقتك بنا 💙");
   return true;
+}
+
+async function applySmmProviderStatus(env, order, normalized) {
+  if (normalized.confirmed) return { changed: await completeSmmProviderOrder(env, order), completed: true };
+
+  const statusLower = normalized.status.toLowerCase();
+  const cancelled = statusLower === "canceled" || statusLower === "cancelled";
+  const previousStatus = String(order.smm_status || "");
+  const newOrderStatus = cancelled ? "cancelled" : "pending";
+  const saved = await env.DB.prepare(
+    "UPDATE orders SET status = ?, smm_status = ? WHERE id = ? AND status = 'pending' AND smm_order_id = ? AND COALESCE(smm_status, '') = ?"
+  ).bind(newOrderStatus, normalized.storedStatus, order.id, String(order.smm_order_id), previousStatus).run();
+  if (!saved?.meta?.changes) return { changed: false, completed: false, cancelled };
+
+  const orderNumber = escapeHtml(order.order_number || ("#" + order.id));
+  if (cancelled) {
+    await queueSmmCustomerNotice(env, order, "cancelled",
+      "❌ <b>تم إلغاء طلبك من جهة الخدمة</b>\n\n📦 طلب المتجر: <code>" + orderNumber + "</code>\nسيتم إرجاع المبلغ إليك في أقرب وقت.");
+  } else if (isSmmInProgressStatus(normalized.status)) {
+    await queueSmmCustomerNotice(env, order, "in_progress",
+      "🔄 <b>بدأ تنفيذ طلبك</b>\n\n📦 طلب المتجر: <code>" + orderNumber + "</code>\nسنبلغك عند اكتماله.");
+  }
+  return { changed: true, completed: false, cancelled };
 }
 
 async function refreshSmmOrderStatus(env, chatId, messageId, orderId, isPhoto = false) {
@@ -2177,18 +2399,19 @@ async function refreshSmmOrderStatus(env, chatId, messageId, orderId, isPhoto = 
     return await showSmmProviderOrder(env, chatId, messageId, order, isPhoto, text);
   }
   const normalized = normalizeSmmProviderStatus(result.data);
-  await env.DB.prepare("UPDATE orders SET smm_status = ? WHERE id = ? AND status = 'pending' AND smm_order_id = ?").bind(normalized.storedStatus, orderId, order.smm_order_id).run();
+  const applied = await applySmmProviderStatus(env, order, normalized);
   if (normalized.confirmed) {
-    const completed = await completeSmmProviderOrder(env, order);
-    const text = completed
+    const text = applied.changed
       ? "✅ أكد الموقع اكتمال الطلب؛ تم تحديث السجل وإبلاغ المشتري."
       : "ℹ️ الطلب محسوم مسبقًا؛ لم يُرسل إشعار اكتمال مكرر.";
     return await editAdminOrderMessage(env, chatId, messageId, text, { inline_keyboard: [[{ text: "⬅️ الطلبات", callback_data: "admin_orders" }]] }, isPhoto);
   }
 
-  const updated = { ...order, smm_status: normalized.storedStatus };
+  const updated = { ...order, smm_status: normalized.storedStatus, status: applied.cancelled ? "cancelled" : order.status };
   let note = "باقي لدى المزود: " + String(result.data?.remains ?? "غير متاح");
   if (normalized.status.toLowerCase() === "completed") note += "\n⚠️ حالة الإكمال غير مؤكدة بالكامل؛ لم نبلغ المشتري ولم نغلق الطلب لأن قيمة المتبقي ليست صفرًا.";
+  if (applied.cancelled && applied.changed) note += "\nتم تسجيل الإلغاء وإضافة إشعار إعادة المبلغ للمشتري.";
+  if (isSmmInProgressStatus(normalized.status) && applied.changed) note += "\nتمت إضافة إشعار بدء التنفيذ للمشتري.";
   if (result.data?.charge !== undefined) note += "\nالكلفة المسجلة لدى المزود: $" + String(result.data.charge);
   return await showSmmProviderOrder(env, chatId, messageId, updated, isPhoto, note);
 }
@@ -2202,7 +2425,7 @@ async function pollPendingSmmOrders(env) {
 
   const loadBatch = async (afterId) => {
     const { results } = await env.DB.prepare(
-      "SELECT id, order_number, user_id, smm_order_id, smm_status FROM orders WHERE status = 'pending' AND type = 'smm' AND smm_order_id IS NOT NULL AND TRIM(smm_order_id) != '' AND LOWER(COALESCE(smm_status, '')) NOT IN ('canceled', 'cancelled', 'partial', 'refunded', 'failed') AND id > ? ORDER BY id ASC LIMIT 20"
+      "SELECT id, order_number, user_id, smm_order_id, smm_status FROM orders WHERE status = 'pending' AND type = 'smm' AND smm_order_id IS NOT NULL AND TRIM(smm_order_id) != '' AND LOWER(COALESCE(smm_status, '')) NOT IN ('canceled', 'cancelled', 'partial', 'refunded', 'failed') AND id > ? ORDER BY id ASC LIMIT 100"
     ).bind(afterId).all();
     return results || [];
   };
@@ -2225,14 +2448,8 @@ async function pollPendingSmmOrders(env) {
         return;
       }
       const normalized = normalizeSmmProviderStatus(result.data);
-      const previousStatus = String(order.smm_status || "");
-      const saved = await env.DB.prepare(
-        "UPDATE orders SET smm_status = ? WHERE id = ? AND status = 'pending' AND smm_order_id = ? AND COALESCE(smm_status, '') = ?"
-      ).bind(normalized.storedStatus, order.id, String(order.smm_order_id), previousStatus).run();
-
-      if (normalized.confirmed) {
-        await completeSmmProviderOrder(env, order);
-      } else if (isTerminalSmmProviderStatus(normalized.status) && saved?.meta?.changes) {
+      const applied = await applySmmProviderStatus(env, order, normalized);
+      if (isTerminalSmmProviderStatus(normalized.status) && applied.changed) {
         await sendMessage(env.BOT_TOKEN, SUPER_ADMIN,
           "⚠️ <b>طلب SMM يحتاج مراجعة</b>\n📦 طلب المتجر: <code>" + escapeHtml(order.order_number || ("#" + order.id)) + "</code>\n🆔 رقم الطلب لدى المزود: <code>" + escapeHtml(order.smm_order_id) + "</code>\nالحالة: <b>" + escapeHtml(normalized.status) + "</b>\nلم يرسل البوت إشعار اكتمال للمشتري.");
       }
@@ -2578,14 +2795,20 @@ async function beginSmmServiceImport(env, chatId, userId, service, messageId = n
   }
 
   const description = content.description;
-  const minQuantity = Math.max(1, parseInt(service.min, 10) || 100);
-  const maxQuantity = Math.max(minQuantity, parseInt(service.max, 10) || 100000);
+  const minQuantity = Number.parseInt(service.min, 10);
+  const maxQuantity = Number.parseInt(service.max, 10);
+  if (!Number.isSafeInteger(minQuantity) || !Number.isSafeInteger(maxQuantity) || minQuantity < 1 || maxQuantity < minQuantity) {
+    const text = "❌ لم أضف الخدمة: الموقع لم يزوّد حدًا أدنى وحدًا أعلى صالحين؛ لا يمكن اعتماد حد أعلى تقديري.";
+    if (messageId) return await editMessage(env.BOT_TOKEN, chatId, messageId, text, { inline_keyboard: [[{ text: "⬅️ إدارة الخدمات", callback_data: "admin_services" }]] });
+    return await sendMessage(env.BOT_TOKEN, chatId, text);
+  }
   const providerService = {
     service_id: serviceId,
     name: content.title,
     description,
     provider_rate_usd: rate,
     min_quantity: minQuantity,
+    provider_min_quantity: minQuantity,
     max_quantity: maxQuantity
   };
   await setAdminState(env, userId, { action: "add_smm_service", step: "category", data: { provider_service: providerService } });
@@ -2596,7 +2819,8 @@ async function beginSmmServiceImport(env, chatId, userId, service, messageId = n
   text += "📂 فئة المزود: " + escapeHtml(service.category || "غير محددة") + "\n";
   if (description) text += "📝 " + escapeHtml(description) + "\n";
   text += "💲 تكلفة المزود: $" + rate.toFixed(4) + " لكل 1000 (حوالي " + Math.round(rate * 1900).toLocaleString() + " د.ع)\n";
-  text += "📊 الحدود: " + minQuantity.toLocaleString() + "–" + maxQuantity.toLocaleString() + "\n\n";
+  text += "📊 الحد الأدنى لدى الموقع: " + minQuantity.toLocaleString() + " (ستحدد الحد الأدنى الذي يظهر للمشتري)\n";
+  text += "📊 الحد الأعلى المعتمد من الموقع: " + maxQuantity.toLocaleString() + "\n\n";
   text += "اختر فئة الخدمة التي ستظهر للمستخدمين:";
   if (messageId) return await editMessage(env.BOT_TOKEN, chatId, messageId, text, smmCategoryKeyboard());
   return await sendMessage(env.BOT_TOKEN, chatId, text, smmCategoryKeyboard());
@@ -2613,7 +2837,7 @@ async function chooseSmmImportCategory(env, chatId, messageId, userId, categoryK
   await setAdminState(env, userId, state);
   const service = state.data.provider_service;
   await editMessage(env.BOT_TOKEN, chatId, messageId,
-    "📌 <b>" + escapeHtml(service.name) + "</b>\n📁 الفئة: " + escapeHtml(category.label) + "\n💲 تكلفة المزود: $" + Number(service.provider_rate_usd).toFixed(4) + " لكل 1000\n\nأرسل <b>سعر البيع بالدينار العراقي لكل 1000</b> (مثال: 5000).",
+    "📌 <b>" + escapeHtml(service.name) + "</b>\n📁 الفئة: " + escapeHtml(category.label) + "\n💲 تكلفة المزود: $" + Number(service.provider_rate_usd).toFixed(4) + " لكل 1000\n📊 الحد الأعلى من الموقع: " + Number(service.max_quantity).toLocaleString() + "\n\nأرسل <b>سعر البيع بالدينار العراقي لكل 1000</b> (مثال: 5000). وبعدها تختار الحد الأدنى بنفسك.",
     { inline_keyboard: [[{ text: "❌ إلغاء", callback_data: "admin_services" }]] });
 }
 

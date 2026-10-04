@@ -55,8 +55,8 @@ class Statement {
     if (q.includes('count(*)') && q.includes('from orders where user_id =')) return { c: this.db.orders.filter(x => x.user_id === Number(p[0])).length };
     if (q.includes('count(*)') && q.includes('from referrals where referrer_id =')) return { c: this.db.referrals.filter(x => x.referrer_id === Number(p[0])).length };
     if (q.includes('count(*)') && q.includes('from gift_requests') && q.includes("status = 'approved'")) return { c: this.db.gifts.filter(x => x.user_id === Number(p[0]) && x.status === 'approved').length };
+    if (q.includes('count(*)') && q.includes('from users')) return { c: this.db.users.filter(x => Number(x.is_blocked || 0) === 0).length };
     if (q.includes('count(*)') && q.includes('from orders')) return { c: this.db.orders.length };
-    if (q.includes('count(*)') && q.includes('from users')) return { c: this.db.users.length };
     if (q.includes('count(*)') && q.includes("status = 'pending'")) return { c: this.db.orders.filter(x => x.status === 'pending').length };
     if (q.includes('count(*)') && q.includes("status = 'completed'")) return { c: this.db.orders.filter(x => x.status === 'completed').length };
     if (q.includes('count(*)') && q.includes('smm_services')) return { c: this.db.services.filter(x => x.is_active).length };
@@ -72,6 +72,8 @@ class Statement {
       return { results: rows };
     }
     if (q.startsWith('select id, order_number, user_id, type, coalesce(target_link, target_username) as target, quantity, price_iqd')) return { results: this.db.orders.filter(x => x.status === 'pending').sort((a,b)=>b.id-a.id).slice(0,10).map(x=>({...x,target:x.target_link||x.target_username})) };
+    if (q.startsWith('select id from users where id >')) return { results: this.db.users.filter(x=>x.id>Number(p[0]||0)&&Number(x.is_blocked||0)===0).sort((a,b)=>a.id-b.id).slice(0,Number(p[1]||100)).map(x=>({id:x.id})) };
+    if (q.startsWith('select key, value from settings where key like')) return { results: [...this.db.settings.entries()].filter(([key,value])=>key.startsWith('smm_customer_notice:')&&(value.status==='pending'||value.status==='sending')).slice(0,Number(p[0]||20)).map(([key,value])=>({key,value:JSON.stringify(value)})) };
     if (q.includes('from gift_requests g left join users')) return { results: this.db.gifts.filter(x => x.status === 'pending').sort((a,b)=>b.id-a.id).slice(0,10).map(x=>({...x, first_name:this.db.users.find(u=>u.id===x.user_id)?.first_name, username:this.db.users.find(u=>u.id===x.user_id)?.username})) };
     if (q.startsWith('select level, status from gift_requests where user_id =')) return { results: this.db.gifts.filter(x => x.user_id === Number(p[0])).map(x=>({level:x.level,status:x.status})) };
     if (q.startsWith('select * from channels where is_active')) return { results: this.db.channels.filter(x => x.is_active) };
@@ -91,6 +93,15 @@ class Statement {
     const q = this.sql.toLowerCase();
     const p = this.params;
     if (q.startsWith('insert or replace into settings')) { this.db.settings.set(p[0], JSON.parse(p[1])); return this.result(1); }
+    if (q.startsWith('insert or ignore into settings')) {
+      if (this.db.settings.has(p[0])) return this.result(0);
+      this.db.settings.set(p[0], JSON.parse(p[1])); return this.result(1);
+    }
+    if (q.startsWith('update settings set value = ? where key = ? and value = ?')) {
+      const current=this.db.settings.get(p[1]);
+      if (current===undefined || JSON.stringify(current)!==p[2]) return this.result(0);
+      this.db.settings.set(p[1],JSON.parse(p[0])); return this.result(1);
+    }
     if (q.startsWith('delete from settings')) { const changed = this.db.settings.delete(p[0]); return this.result(changed ? 1 : 0); }
     if (q.startsWith('insert or ignore into admins')) {
       if (this.db.admins.some(x=>x.user_id===Number(p[0]))) return this.result(0);
@@ -165,6 +176,11 @@ class Statement {
     if (q.startsWith("update orders set status = 'completed', completed_at = current_timestamp, smm_status = 'completed'")) {
       const order=this.db.orders.find(x=>x.id===Number(p[0])&&x.status==='pending'&&String(x.smm_order_id)===String(p[1]));
       if(order){order.status='completed';order.smm_status='Completed';}
+      return this.result(order?1:0);
+    }
+    if (q.startsWith('update orders set status = ?, smm_status = ?')) {
+      const order=this.db.orders.find(x=>x.id===Number(p[2])&&x.status==='pending'&&String(x.smm_order_id)===String(p[3])&&String(x.smm_status||'')===String(p[4]||''));
+      if(order){order.status=p[0];order.smm_status=p[1];}
       return this.result(order?1:0);
     }
     if (q.startsWith('update orders set status = \'completed\'')) {
@@ -318,6 +334,15 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
   });
 
   await t.test('admin can remove stars and premium packages without losing historical orders', async () => {
+    db.admins.push({user_id:123456,name:'Secondary admin',added_by:ADMIN});
+    await click(123456,'admin_pkg_list_stars');
+    assert.ok(JSON.stringify(telegramCalls.filter(x=>x.method==='editMessageText').at(-1).body.reply_markup).includes('admin_pkg_delete_1'),'secondary admins can access package management');
+    await click(123456,'admin_pkg_delete_1');
+    await click(123456,'admin_pkg_delete_confirm_1');
+    assert.equal(db.packages.find(x=>x.id===1).is_active,0,'secondary admin can confirm package removal');
+    db.packages.find(x=>x.id===1).is_active=1;
+    db.admins.splice(db.admins.findIndex(x=>x.user_id===123456),1);
+
     await click(ADMIN,'admin_pkg_list_stars');
     const packageList=telegramCalls.filter(x=>x.method==='editMessageText').at(-1);
     assert.ok(JSON.stringify(packageList.body.reply_markup).includes('admin_pkg_delete_1'));
@@ -353,6 +378,26 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     assert.equal(db.settings.has(`user_state_${USER}`),false);
     const mainMenu=telegramCalls.filter(x=>x.method==='editMessageText').at(-1);
     assert.ok(JSON.stringify(mainMenu.body.reply_markup).includes('show_ad'));
+  });
+
+  await t.test('admin broadcast previews and queues a text message for active bot members', async () => {
+    db.users.push({id:100,first_name:'Blocked',username:'blocked',is_blocked:1});
+    const before=telegramCalls.length;
+    await click(ADMIN,'admin_broadcast');
+    assert.equal(db.settings.get(`admin_state_${ADMIN}`).action,'admin_broadcast');
+    await message(ADMIN,'تنبيه <b>تجربة</b>');
+    const preview=telegramCalls.slice(before).find(x=>x.method==='sendMessage'&&x.body.chat_id===ADMIN&&String(x.body.text).includes('معاينة الرسالة'));
+    assert.ok(preview);
+    assert.match(preview.body.text,/&lt;b&gt;تجربة&lt;\/b&gt;/,'admin message is safely escaped in HTML preview');
+    assert.ok(JSON.stringify(preview.body.reply_markup).includes('admin_broadcast_confirm'));
+    await click(ADMIN,'admin_broadcast_confirm');
+    assert.equal(db.settings.get('admin_broadcast_job').status,'running');
+    await runScheduled();
+    assert.equal(db.settings.has('admin_broadcast_job'),false,'completed broadcast job is cleared');
+    const broadcastMessages=telegramCalls.slice(before).filter(x=>x.method==='sendMessage'&&String(x.body.text).startsWith('تنبيه &lt;b&gt;تجربة'));
+    assert.deepEqual(broadcastMessages.map(x=>Number(x.body.chat_id)).sort((a,b)=>a-b),[ADMIN,USER,99].sort((a,b)=>a-b));
+    assert.equal(broadcastMessages.some(x=>Number(x.body.chat_id)===100),false,'blocked users are skipped');
+    assert.ok(telegramCalls.slice(before).some(x=>x.method==='sendMessage'&&x.body.chat_id===ADMIN&&String(x.body.text).includes('اكتمل إرسال الرسالة الجماعية')));
   });
 
   await t.test('admin category and all service input steps save correct data', async () => {
@@ -391,6 +436,11 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     state=db.settings.get(`admin_state_${ADMIN}`);
     assert.equal(state.step,'sell_price_iqd');
     await message(ADMIN,'٧٥٠٠');
+    state=db.settings.get(`admin_state_${ADMIN}`);
+    assert.equal(state.step,'min_quantity','admin must choose the shop minimum after setting retail price');
+    await message(ADMIN,'25');
+    assert.equal(db.settings.get(`admin_state_${ADMIN}`).step,'min_quantity','minimum below provider minimum must be rejected');
+    await message(ADMIN,'100');
     const imported=db.services.find(x=>x.smmcp_service_id==='101');
     assert.equal(imported.category,'إنستغرام');
     assert.equal(imported.name,'متابعين انستقرام [حسابات عربية حقيقية] [عن طريق الاعلانات] [هام: اغلاق خاصية المراجعة قبل الطلب] [لا يمكن الغاء الطلب بعد وضعه]');
@@ -398,7 +448,7 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     assert.doesNotMatch(imported.description,/Default/);
     assert.equal(imported.provider_rate_usd,0.9);
     assert.equal(imported.sell_price_iqd,7500);
-    assert.equal(imported.min_quantity,50);
+    assert.equal(imported.min_quantity,100,'shop minimum is selected by admin and may be raised from provider minimum');
     assert.equal(imported.max_quantity,10000);
     assert.equal(db.settings.has(`admin_state_${ADMIN}`),false);
 
@@ -427,6 +477,38 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     assert.match(details.body.text,/متابعون عرب حقيقيون/);
     assert.match(details.body.text,/متابعين انستقرام \[حسابات عربية حقيقية\]/);
     assert.doesNotMatch(details.body.text,/شرح الخدمة:<\/b>\nحسابات عربية حقيقية/);
+
+    beforeView=telegramCalls.length;
+    await click(USER,`order_svc_${imported.id}`);
+    const linkPrompt=telegramCalls.slice(beforeView).find(x=>x.method==='editMessageText');
+    assert.match(linkPrompt.body.text,/رابط الحساب أو القناة/);
+    assert.match(linkPrompt.body.text,/https:\/\/www\.instagram\.com\/username\//);
+    assert.doesNotMatch(linkPrompt.body.text,/الحد الأدنى|الحد الأقصى|100–10000/,'link prompt only explains the required URL');
+    await click(USER,'order_cancel');
+  });
+
+  await t.test('main SMM services give platform-specific public-link examples only', async () => {
+    const cases=[
+      {id:1101,key:'telegram',category:'تيليجرام',example:'https://t.me/channelusername'},
+      {id:1102,key:'instagram',category:'إنستغرام',example:'https://www.instagram.com/username/'},
+      {id:1103,key:'tiktok',category:'تيك توك',example:'https://www.tiktok.com/@username'},
+      {id:1104,key:'facebook',category:'فيسبوك',example:'https://www.facebook.com/PageName'},
+      {id:1105,key:'snapchat',category:'سناب شات',example:'https://www.snapchat.com/add/username'},
+      {id:1106,key:'twitter',category:'X',example:'https://x.com/username'},
+      {id:1107,key:'youtube',category:'يوتيوب',example:'https://www.youtube.com/@ChannelName'}
+    ];
+    for (const item of cases) {
+      db.services.push({id:item.id,smmcp_service_id:`manual_${item.id}`,category:item.category,name:'متابعين الحساب',description:'',sell_price_iqd:1000,min_quantity:1,max_quantity:500,is_active:1});
+      await click(USER,`order_svc_${item.id}`);
+      const prompt=telegramCalls.filter(x=>x.method==='editMessageText').at(-1);
+      assert.ok(prompt.body.text.includes(item.example),`${item.category} uses its matching URL example`);
+      assert.doesNotMatch(prompt.body.text,/الحد الأدنى|الحد الأقصى|الكمية المسموحة/);
+      await click(USER,'order_cancel');
+      await click(USER,`smm_${item.key}`);
+      const categoryMenu=telegramCalls.filter(x=>x.method==='editMessageText').at(-1);
+      assert.ok(categoryMenu.body.text.includes(item.example),`${item.category} category menu shows relevant examples`);
+    }
+    for (const item of cases) db.services.splice(db.services.findIndex(x=>x.id===item.id),1);
   });
 
   await t.test('admin can permanently delete an unused service and safely hide one with order history', async () => {
@@ -537,11 +619,16 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     await click(ADMIN,'admin_confirm_final_10');
     assert.equal(order.status,'pending','a provider-backed order cannot be manually completed before provider confirmation');
     smmStatusResponse={charge:'0.12',status:'In progress',remains:'200',start_count:'50',currency:'USD'};
+    const startedCount=()=>telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('بدأ تنفيذ طلبك')).length;
+    const startsBefore=startedCount();
     await click(ADMIN,'admin_smm_status_10');
     assert.equal(smmApiCalls.at(-1).action,'status');
     assert.equal(smmApiCalls.at(-1).order,'880010');
     assert.equal(order.smm_status,'In progress');
     assert.equal(order.status,'pending');
+    assert.equal(startedCount(),startsBefore+1,'first confirmed in-progress status notifies the buyer');
+    await click(ADMIN,'admin_smm_status_10');
+    assert.equal(startedCount(),startsBefore+1,'repeated in-progress checks do not spam the buyer');
 
     smmStatusResponse={charge:'0.12',status:'Completed',remains:'0',start_count:'250',currency:'USD'};
     const noticesBefore=telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تم اكتمال طلبك بنجاح')).length;
@@ -586,7 +673,15 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
   await t.test('scheduled polling only notifies the buyer after provider confirms Completed with zero remaining', async () => {
     const order=db.orders.find(x=>x.id===11);
     const countNotices=()=>telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('تم اكتمال طلبك بنجاح')).length;
+    const countStarted=()=>telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('بدأ تنفيذ طلبك')).length;
     const before=countNotices();
+    const beforeStarted=countStarted();
+    smmStatusResponse={charge:'0.12',status:'Pending',remains:'300',start_count:'0',currency:'USD'};
+    await runScheduled();
+    assert.equal(order.status,'pending');
+    assert.equal(order.smm_status,'Pending');
+    assert.equal(countStarted(),beforeStarted,'pending provider status sends no status message to the buyer');
+
     smmStatusResponse={charge:'0.12',status:'Completed',start_count:'299',currency:'USD'};
     await runScheduled();
     assert.equal(order.status,'pending','without an explicit zero remainder, completion is not proven');
@@ -609,6 +704,21 @@ test('protected buttons, customer order state, admin service flow, and gift/orde
     const apiCallsAfterCompletion=smmApiCalls.filter(x=>x.action==='status').length;
     await runScheduled();
     assert.equal(smmApiCalls.filter(x=>x.action==='status').length,apiCallsAfterCompletion,'completed orders stop polling and do not notify twice');
+    smmStatusResponse={charge:'0.12',status:'In progress',remains:'250',start_count:'0',currency:'USD'};
+  });
+
+  await t.test('scheduled cancellation informs the buyer about the refund and closes the shop order', async () => {
+    const order={id:13,order_number:'AP-TEST-SMM-13',user_id:USER,type:'smm',service_id:5,target_link:'https://t.me/example',quantity:100,price_iqd:500,status:'pending',smm_order_id:'880013',smm_status:'In progress'};
+    db.orders.push(order);
+    smmStatusResponse={charge:'0',status:'Canceled',remains:'100',start_count:'0',currency:'USD'};
+    const before=telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('سيتم إرجاع المبلغ')).length;
+    await runScheduled();
+    assert.equal(order.status,'cancelled');
+    assert.equal(order.smm_status,'Canceled');
+    const refundNotice=telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('سيتم إرجاع المبلغ')).at(-1);
+    assert.ok(refundNotice);
+    assert.equal(telegramCalls.filter(x=>x.method==='sendMessage'&&x.body.chat_id===USER&&String(x.body.text).includes('سيتم إرجاع المبلغ')).length,before+1);
+    assert.doesNotMatch(refundNotice.body.text,/SMMCPAN|مزود|رقم التنفيذ/);
     smmStatusResponse={charge:'0.12',status:'In progress',remains:'250',start_count:'0',currency:'USD'};
   });
 
